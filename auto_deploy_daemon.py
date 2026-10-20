@@ -281,23 +281,15 @@ def prepare_dependency_set(remote_stage: str, sha: str, release: Path, requireme
 
 
 def replace_app_files(source_root: Path) -> None:
-    docker_exec("rm", "-rf", f"{APP_DIR}/app", f"{APP_DIR}/frontend", timeout=30)
-    docker_exec("mkdir", "-p", APP_DIR, timeout=15)
-    run_cmd(["docker", "cp", str(source_root / "app"), f"{DOCKER_CONTAINER}:{APP_DIR}/"], timeout=90)
-    run_cmd(["docker", "cp", str(source_root / "frontend"), f"{DOCKER_CONTAINER}:{APP_DIR}/"], timeout=90)
+    # docker cp can write to a stopped container. Copy directory contents into
+    # the already-existing destinations; this also lets rollback work when the
+    # application process failed to start and docker exec is unavailable.
+    # Unreferenced files removed upstream can remain as harmless orphans; the
+    # current app/frontend entrypoints determine which files are actually used.
+    run_cmd(["docker", "cp", str(source_root / "app") + "/.", f"{DOCKER_CONTAINER}:{APP_DIR}/app/"], timeout=90)
+    run_cmd(["docker", "cp", str(source_root / "frontend") + "/.", f"{DOCKER_CONTAINER}:{APP_DIR}/frontend/"], timeout=90)
     run_cmd(
         ["docker", "cp", str(source_root / REQUIREMENTS_FILENAME), f"{DOCKER_CONTAINER}:{APP_DIR}/{REQUIREMENTS_FILENAME}"],
-        timeout=30,
-    )
-
-
-def replace_app_from_remote_stage(remote_stage: str) -> None:
-    docker_exec("rm", "-rf", f"{APP_DIR}/app", f"{APP_DIR}/frontend", timeout=30)
-    docker_exec("mkdir", "-p", APP_DIR, timeout=15)
-    run_cmd(["docker", "cp", f"{DOCKER_CONTAINER}:{remote_stage}/app", f"{DOCKER_CONTAINER}:{APP_DIR}/"], timeout=90)
-    run_cmd(["docker", "cp", f"{DOCKER_CONTAINER}:{remote_stage}/frontend", f"{DOCKER_CONTAINER}:{APP_DIR}/"], timeout=90)
-    run_cmd(
-        ["docker", "cp", f"{DOCKER_CONTAINER}:{remote_stage}/{REQUIREMENTS_FILENAME}", f"{DOCKER_CONTAINER}:{APP_DIR}/{REQUIREMENTS_FILENAME}"],
         timeout=30,
     )
 
@@ -424,7 +416,7 @@ def perform_update(sha: str, state: dict[str, Any]) -> dict[str, Any]:
         # The existing process keeps serving until all validation and downloads are done.
         container_stop_if_running()
         app_was_stopped = True
-        replace_app_from_remote_stage(remote_stage)
+        replace_app_files(release)
         if dependency_changed:
             write_dependency_pointer(dependency_sha, site_packages, work_dir)
         container_start()
