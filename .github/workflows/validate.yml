@@ -1,0 +1,28 @@
+name: Validate updater
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile updater
+        run: python -m py_compile auto_deploy_daemon.py
+      - name: Validate installer shell syntax
+        run: sh -n install.sh
+      - name: Verify service files refer to installed paths
+        run: |
+          grep -F 'ExecStart=/usr/bin/python3 /DATA/AppData/ai-ch-updater/auto_deploy_daemon.py' ai-ch-updater.service
+          grep -F 'OnUnitActiveSec=3min' ai-ch-updater.timer
