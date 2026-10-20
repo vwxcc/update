@@ -1,0 +1,8 @@
+.env
+*.log
+state.json
+updater.lock
+releases/
+backups/
+logs/
+__pycache__/
