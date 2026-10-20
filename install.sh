@@ -33,32 +33,47 @@ chmod 755 "$INSTALL_DIR/auto_deploy_daemon.py"
 
 container_name=""
 health_port=""
-printf "Имя существующего контейнера ai-ch [chatstudio-v2]: "
-read -r container_name || true
-if [ -z "$container_name" ]; then
-  container_name=chatstudio-v2
-fi
-case "$container_name" in
-  *[!A-Za-z0-9_.-]*)
-    echo "Недопустимое имя контейнера: используйте латинские буквы, цифры, точку, дефис или подчёркивание." >&2
+health_url=""
+if [ -f /etc/ai-ch-updater.env ]; then
+  echo "Найдена существующая конфигурация — сохраняю имя контейнера и адрес health-check."
+  container_name=$(sed -n 's/^DOCKER_CONTAINER=//p' /etc/ai-ch-updater.env | head -n 1)
+  health_url=$(sed -n 's/^HEALTH_URL=//p' /etc/ai-ch-updater.env | head -n 1)
+  if [ -z "$container_name" ]; then
+    echo "В /etc/ai-ch-updater.env не задан DOCKER_CONTAINER." >&2
     exit 1
-    ;;
-esac
+  fi
+  health_port=$(printf '%s' "$health_url" | sed -n 's#^http://127[.]0[.]0[.]1:\([0-9][0-9]*\)/.*#\1#p')
+  if [ -z "$health_port" ]; then
+    health_port=3050
+  fi
+else
+  printf "Имя существующего контейнера ai-ch [chatstudio-v2]: "
+  read -r container_name || true
+  if [ -z "$container_name" ]; then
+    container_name=chatstudio-v2
+  fi
+  case "$container_name" in
+    *[!A-Za-z0-9_.-]*)
+      echo "Недопустимое имя контейнера: используйте латинские буквы, цифры, точку, дефис или подчёркивание." >&2
+      exit 1
+      ;;
+  esac
 
-printf "Порт приложения на хосте для health-check [3050]: "
-read -r health_port || true
-if [ -z "$health_port" ]; then
-  health_port=3050
-fi
-case "$health_port" in
-  *[!0-9]*|"")
-    echo "Порт должен быть числом." >&2
+  printf "Порт приложения на хосте для health-check [3050]: "
+  read -r health_port || true
+  if [ -z "$health_port" ]; then
+    health_port=3050
+  fi
+  case "$health_port" in
+    *[!0-9]*|"")
+      echo "Порт должен быть числом." >&2
+      exit 1
+      ;;
+  esac
+  if [ "$health_port" -lt 1 ] || [ "$health_port" -gt 65535 ]; then
+    echo "Порт должен быть в диапазоне 1–65535." >&2
     exit 1
-    ;;
-esac
-if [ "$health_port" -lt 1 ] || [ "$health_port" -gt 65535 ]; then
-  echo "Порт должен быть в диапазоне 1–65535." >&2
-  exit 1
+  fi
 fi
 
 if ! docker inspect "$container_name" >/dev/null 2>&1; then
