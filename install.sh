@@ -139,7 +139,7 @@ systemctl enable --now ai-ch-updater.timer
 echo
 echo "Установлено."
 echo "Контейнер: $container_name"
-echo "Health-check: http://127.0.0.1:$health_port/api/health"
+echo "Health-check: $(sed -n 's/^HEALTH_URL=//p' /etc/ai-ch-updater.env | head -n 1)"
 echo "Проверка GitHub запланирована каждые 3 минуты."
 echo "Первый запуск таймера может установить актуальный main и перезапустить контейнер."
 echo "Состояние: $INSTALL_DIR/state.json"
