@@ -1,0 +1,13 @@
+[Unit]
+Description=ai-ch GitHub updater (staged update with health-check rollback)
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/ai-ch-updater.env
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/DATA/AppData/ai-ch-updater
+ExecStart=/usr/bin/python3 /DATA/AppData/ai-ch-updater/auto_deploy_daemon.py
+TimeoutStartSec=20min
+Nice=10
