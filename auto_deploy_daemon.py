@@ -236,6 +236,8 @@ def snapshot_container(backup: Path) -> None:
 
 
 def stage_inside_container(release: Path, remote_stage: str) -> None:
+    # Remove an incomplete stage left by an earlier failed attempt for this SHA.
+    docker_exec("rm", "-rf", remote_stage, timeout=20)
     docker_exec("mkdir", "-p", remote_stage, timeout=15)
     run_cmd(["docker", "cp", str(release / "app"), f"{DOCKER_CONTAINER}:{remote_stage}/"], timeout=60)
     run_cmd(["docker", "cp", str(release / "frontend"), f"{DOCKER_CONTAINER}:{remote_stage}/"], timeout=60)
