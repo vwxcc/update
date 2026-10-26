@@ -50,10 +50,20 @@ sudo sh /tmp/ai-ch-updater-install.sh
 ## Проверка состояния
 
 ```sh
-systemctl status ai-ch-updater.timer
+systemctl status ai-ch-recovery.service --no-pager
+systemctl status ai-ch-updater.timer --no-pager
 systemctl list-timers ai-ch-updater.timer
+docker inspect ai-ch --format 'running={{.State.Running}} restart={{.HostConfig.RestartPolicy.Name}}'
 docker ps --filter name=ai-ch
 docker logs --tail 100 ai-ch
+```
+
+Для переживания выключения или перезагрузки ZimaOS установщик задаёт контейнеру политику Docker `unless-stopped` и включает `ai-ch-recovery.service`. После запуска Docker служба дополнительно проверяет контейнер и запускает его, если он остановлен. База данных, загрузки и `.env` находятся вне слоя приложения и при таком восстановлении не удаляются.
+
+Проверить журнал восстановления после загрузки:
+
+```sh
+sudo journalctl -u ai-ch-recovery.service -b --no-pager
 ```
 
 Запустить проверку обновлений вручную:
