@@ -22,7 +22,12 @@ jobs:
         run: python -m py_compile auto_deploy_daemon.py
       - name: Validate installer shell syntax
         run: sh -n install.sh
-      - name: Verify service files refer to installed paths
+      - name: Test private GitHub token handling
+        run: python -m unittest discover -s tests -p 'test_github_auth.py' -v
+      - name: Verify service files refer to installed paths and token auth is configured
         run: |
           grep -F 'ExecStart=/usr/bin/python3 /DATA/AppData/ai-ch-updater/auto_deploy_daemon.py' ai-ch-updater.service
           grep -F 'OnUnitActiveSec=3min' ai-ch-updater.timer
+          grep -F 'GITHUB_TOKEN=$GITHUB_TOKEN' install.sh
+          grep -F 'Authorization' auto_deploy_daemon.py
+          grep -F 'SafeGitHubArchiveRedirectHandler' auto_deploy_daemon.py
