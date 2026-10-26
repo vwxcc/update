@@ -30,6 +30,7 @@ from typing import Any
 
 GITHUB_REPO = os.getenv("GITHUB_REPO", "vwxcc/deepseekw").strip()
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main").strip()
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 TARGET_MODE = os.getenv("TARGET_MODE", "docker").strip().lower()
 DOCKER_CONTAINER = os.getenv("DOCKER_CONTAINER", "chatstudio-v2").strip()
 APP_DIR = os.getenv("APP_DIR", "/app").rstrip("/")
@@ -39,7 +40,7 @@ HTTP_TIMEOUT = max(5, int(os.getenv("HTTP_TIMEOUT", "25")))
 KEEP_RELEASES = max(2, min(10, int(os.getenv("KEEP_RELEASES", "3"))))
 UPDATE_ROOT = Path(os.getenv("UPDATE_ROOT", "/DATA/AppData/ai-ch-updater")).expanduser()
 API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/commits/{GITHUB_BRANCH}"
-ARCHIVE_URL = f"https://codeload.github.com/{GITHUB_REPO}/tar.gz/"
+ARCHIVE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/tarball/"
 USER_AGENT = "ai-ch-zimaos-updater/1.0"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 REQUIREMENTS_FILENAME = "requirements.txt"
@@ -119,8 +120,40 @@ def write_state(state: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+def github_headers(*, accept: str = "application/vnd.github+json") -> dict[str, str]:
+    """Build private-repository API headers without ever logging the token."""
+    if not GITHUB_TOKEN:
+        raise RuntimeError(
+            "Не задан GITHUB_TOKEN. Создайте fine-grained GitHub token с Contents: Read-only "
+            "только для vwxcc/deepseekw и сохраните его в /etc/ai-ch-updater.env (права 600)."
+        )
+    if not re.fullmatch(r"[A-Za-z0-9_]+", GITHUB_TOKEN):
+        raise RuntimeError("GITHUB_TOKEN содержит недопустимые символы; секрет не был отправлен.")
+    return {
+        "User-Agent": USER_AGENT,
+        "Accept": accept,
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def github_http_error(exc: urllib.error.HTTPError, *, downloading: bool = False) -> RuntimeError:
+    if exc.code == 401:
+        message = "GitHub отклонил GITHUB_TOKEN: токен неверен, истёк или отозван."
+    elif exc.code == 403 and exc.headers.get("X-RateLimit-Remaining") == "0":
+        message = "GitHub API исчерпал лимит запросов; следующая проверка будет выполнена таймером."
+    elif exc.code == 403:
+        message = "GitHub запретил доступ. Проверьте доступ токена к vwxcc/deepseekw и разрешение Contents: Read-only."
+    elif exc.code == 404:
+        message = "GitHub вернул 404. Для приватного репозитория это обычно означает, что токен не имеет доступа к vwxcc/deepseekw."
+    else:
+        action = "скачать архив" if downloading else "проверить ветку"
+        message = f"GitHub API вернул HTTP {exc.code}, не удалось {action}."
+    return RuntimeError(message)
+
+
 def github_latest(state: dict[str, Any]) -> tuple[str, str | None]:
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"}
+    headers = github_headers()
     if state.get("etag"):
         headers["If-None-Match"] = str(state["etag"])
     request = urllib.request.Request(API_URL, headers=headers)
@@ -134,22 +167,24 @@ def github_latest(state: dict[str, Any]) -> tuple[str, str | None]:
     except urllib.error.HTTPError as exc:
         if exc.code == 304 and SHA_RE.fullmatch(str(state.get("remote_sha", ""))):
             return str(state["remote_sha"]), str(state.get("etag", "")) or None
-        if exc.code == 403 and exc.headers.get("X-RateLimit-Remaining") == "0":
-            raise RuntimeError("GitHub API исчерпал лимит запросов; следующая проверка будет выполнена таймером.")
-        raise RuntimeError(f"GitHub API вернул HTTP {exc.code}.") from exc
+        raise github_http_error(exc) from exc
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Не удалось проверить GitHub: {exc}") from exc
 
 
 def download_archive(sha: str, destination: Path) -> None:
+    # Use the authenticated GitHub API archive endpoint. GitHub redirects to a
+    # short-lived codeload URL; urllib strips Authorization on cross-host redirects.
     request = urllib.request.Request(
-        ARCHIVE_URL + sha,
-        headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"},
+        ARCHIVE_API_URL + sha,
+        headers=github_headers(accept="application/vnd.github+json"),
     )
     try:
-        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+        with urllib.request.urlopen(request, timeout=max(HTTP_TIMEOUT, 120)) as response:
             content = response.read(100 * 1024 * 1024 + 1)
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
+    except urllib.error.HTTPError as exc:
+        raise github_http_error(exc, downloading=True) from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
         raise RuntimeError(f"Не удалось скачать исходный код коммита {sha[:12]}: {exc}") from exc
     if not content or len(content) > 100 * 1024 * 1024:
         raise RuntimeError("Архив GitHub пустой либо превышает допустимый размер 100 MiB.")
