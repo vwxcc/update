@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+umask 077
 
 # Fresh deployment + automatic updater for ai-ch on a ZimaOS host.
 # Uses python:3.12-slim and docker cp; no Dockerfile build/buildx required.
@@ -23,6 +24,93 @@ BRANCH=main
 RAW_BASE=https://raw.githubusercontent.com/vwxcc/update/main
 mkdir -p "$APP_ROOT" "$APP_ROOT/data" "$APP_ROOT/uploads" "$UPDATE_ROOT"
 chmod 755 "$APP_ROOT" "$APP_ROOT/data" "$APP_ROOT/uploads" "$UPDATE_ROOT"
+
+CURL_CONFIG=""
+cleanup_curl_config() {
+  [ -z "$CURL_CONFIG" ] || rm -f -- "$CURL_CONFIG"
+}
+trap cleanup_curl_config EXIT HUP INT TERM
+
+# Download the GitHub archive through the authenticated API endpoint. The API
+# returns a short-lived codeload URL; fetch that second URL without credentials.
+download_private_archive() {
+  api_url=$1
+  output_file=$2
+  headers_file=$(mktemp "$UPDATE_ROOT/.archive-headers.XXXXXX")
+  body_file=$(mktemp "$UPDATE_ROOT/.archive-body.XXXXXX")
+  if ! curl --config "$CURL_CONFIG" --silent --show-error --connect-timeout 15 \
+      --max-time 35 --dump-header "$headers_file" --output "$body_file" "$api_url" 2>/dev/null; then
+    rm -f "$headers_file" "$body_file"
+    echo "Не удалось запросить архив приватного репозитория GitHub." >&2
+    return 1
+  fi
+  status=$(awk '/^HTTP\// { code=$2 } END { print code }' "$headers_file")
+  case "$status" in
+    200)
+      mv "$body_file" "$output_file"
+      ;;
+    301|302|303|307|308)
+      location=$(sed -n 's/^[Ll]ocation:[[:space:]]*//p' "$headers_file" | tr -d '\r' | tail -n 1)
+      case "$location" in
+        https://codeload.github.com/*) ;;
+        *)
+          rm -f "$headers_file" "$body_file"
+          echo "GitHub вернул неожиданный адрес архива; скачивание остановлено." >&2
+          return 1
+          ;;
+      esac
+      # The redirect URL is temporary and signed. Do not print or persist it,
+      # and never send the PAT to codeload.
+      if ! curl --fail --silent --show-error --location --retry 3 \
+          --connect-timeout 15 --max-time 300 "$location" --output "$output_file" 2>/dev/null; then
+        rm -f "$headers_file" "$body_file" "$output_file"
+        echo "Не удалось скачать архив по временному адресу GitHub." >&2
+        return 1
+      fi
+      rm -f "$body_file"
+      ;;
+    *)
+      rm -f "$headers_file" "$body_file"
+      echo "GitHub не вернул ожидаемый архив или перенаправление (HTTP ${status:-unknown}). Проверь токен и права Contents: Read-only." >&2
+      return 1
+      ;;
+  esac
+  rm -f "$headers_file"
+  [ -s "$output_file" ] || {
+    rm -f "$output_file"
+    echo "GitHub вернул пустой архив." >&2
+    return 1
+  }
+}
+
+# Reuse the existing host-only token on upgrades. Never store it in the app .env.
+GITHUB_TOKEN=${GITHUB_TOKEN:-}
+if [ -z "$GITHUB_TOKEN" ] && [ -r /etc/ai-ch-updater.env ]; then
+  GITHUB_TOKEN=$(sed -n 's/^GITHUB_TOKEN=//p' /etc/ai-ch-updater.env | head -n 1 | tr -d '\r')
+fi
+if [ -z "$GITHUB_TOKEN" ]; then
+  echo
+  echo "Для скачивания приватного vwxcc/deepseekw нужен GitHub fine-grained token."
+  echo "Разрешения: только репозиторий vwxcc/deepseekw, Contents: Read-only."
+  printf "GitHub token (ввод скрыт): "
+  stty -echo 2>/dev/null || true
+  read -r GITHUB_TOKEN || true
+  stty echo 2>/dev/null || true
+  printf "\n"
+fi
+case "$GITHUB_TOKEN" in
+  ""|*[!A-Za-z0-9_]*)
+    echo "Токен пустой или содержит неподдерживаемые символы; разрешены только латинские буквы, цифры и подчёркивание." >&2
+    exit 1
+    ;;
+esac
+CURL_CONFIG=$(mktemp "$UPDATE_ROOT/.github-curl.XXXXXX")
+chmod 600 "$CURL_CONFIG"
+cat > "$CURL_CONFIG" <<EOF
+header = "Authorization: Bearer $GITHUB_TOKEN"
+header = "Accept: application/vnd.github+json"
+header = "X-GitHub-Api-Version: 2022-11-28"
+EOF
 
 printf "Имя контейнера ai-ch [ai-ch]: "
 read -r container_name || true
@@ -91,31 +179,36 @@ if docker inspect "$container_name" >/dev/null 2>&1; then
   container_exists=true
 fi
 
+# Validate credentials before changing the service or installing the timer.
+META_FILE="$UPDATE_ROOT/.github-commit.json"
+echo "Проверяю доступ к приватному репозиторию $REPO/$BRANCH..."
+if ! curl --config "$CURL_CONFIG" --fail --silent --show-error --connect-timeout 15 \
+    --max-time 35 "https://api.github.com/repos/$REPO/commits/$BRANCH" -o "$META_FILE"; then
+  rm -f "$META_FILE"
+  echo "Не удалось прочитать приватный репозиторий. Проверь token, его срок действия и Contents: Read-only для vwxcc/deepseekw." >&2
+  exit 1
+fi
+commit_sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["sha"])' "$META_FILE")
+case "$commit_sha" in
+  ????????*) ;;
+  *) echo "GitHub не вернул SHA коммита." >&2; exit 1 ;;
+esac
+case "$commit_sha" in
+  *[!0-9a-fA-F]*) echo "GitHub вернул некорректный SHA." >&2; exit 1 ;;
+esac
+if [ "${#commit_sha}" -ne 40 ]; then
+  echo "GitHub вернул SHA неверной длины." >&2
+  exit 1
+fi
+
 if [ "$container_exists" = "false" ]; then
   echo
-  echo "Скачиваю фиксированный коммит $REPO/$BRANCH..."
-  META_FILE="$UPDATE_ROOT/.github-commit.json"
-  curl --fail --silent --show-error --location \
-    "https://api.github.com/repos/$REPO/commits/$BRANCH" -o "$META_FILE"
-  commit_sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["sha"])' "$META_FILE")
-  case "$commit_sha" in
-    ????????*) ;;
-    *) echo "GitHub не вернул SHA коммита." >&2; exit 1 ;;
-  esac
-  case "$commit_sha" in
-    *[!0-9a-fA-F]*) echo "GitHub вернул некорректный SHA." >&2; exit 1 ;;
-  esac
-  if [ "${#commit_sha}" -ne 40 ]; then
-    echo "GitHub вернул SHA неверной длины." >&2
-    exit 1
-  fi
-
+  echo "Скачиваю фиксированный коммит $REPO/$BRANCH ($commit_sha)..."
   STAGE="$UPDATE_ROOT/initial-install"
   rm -rf "$STAGE"
   mkdir -p "$STAGE"
   ARCHIVE="$UPDATE_ROOT/.ai-ch-source.tar.gz"
-  curl --fail --silent --show-error --location \
-    "https://codeload.github.com/$REPO/tar.gz/$commit_sha" -o "$ARCHIVE"
+  download_private_archive "https://api.github.com/repos/$REPO/tarball/$commit_sha" "$ARCHIVE"
   tar -xzf "$ARCHIVE" -C "$STAGE"
   rm -f "$ARCHIVE"
   SOURCE_DIR=$(find "$STAGE" -mindepth 1 -maxdepth 1 -type d | head -n 1)
@@ -254,6 +347,7 @@ chmod 755 "$UPDATE_ROOT/auto_deploy_daemon.py"
 cat > /etc/ai-ch-updater.env <<EOF
 GITHUB_REPO=$REPO
 GITHUB_BRANCH=$BRANCH
+GITHUB_TOKEN=$GITHUB_TOKEN
 TARGET_MODE=docker
 DOCKER_CONTAINER=$container_name
 APP_DIR=/app
@@ -264,6 +358,7 @@ KEEP_RELEASES=3
 UPDATE_ROOT=$UPDATE_ROOT
 EOF
 chmod 600 /etc/ai-ch-updater.env
+rm -f "$META_FILE"
 
 cat > /etc/systemd/system/ai-ch-updater.service <<EOF
 [Unit]
@@ -305,8 +400,9 @@ echo
 echo "Готово: AI CH установлен и отвечает на $HEALTH_URL"
 echo "Контейнер: $container_name"
 echo "Постоянные данные: $APP_ROOT/data и $APP_ROOT/uploads"
-echo "Секреты/админ: $APP_ROOT/.env (права 600; не публикуй этот файл)"
-echo "Автообновление: каждые 3 минуты, ветка $REPO/$BRANCH"
+echo "Секреты приложения: $APP_ROOT/.env (права 600; не публикуй этот файл)"
+echo "Токен GitHub: /etc/ai-ch-updater.env (права 600; не копируется в контейнер)"
+echo "Автообновление приватного репозитория: каждые 3 минуты, ветка $REPO/$BRANCH"
 echo "Статус: systemctl status ai-ch-updater.timer"
 echo "Логи приложения: docker logs --tail 100 $container_name"
 echo "Логи обновлятора: $UPDATE_ROOT/logs/updater.log"
