@@ -200,6 +200,52 @@ else
   fi
 fi
 
+# Ensure the container survives host shutdowns/reboots, including containers
+# created by an older version of this installer.
+docker update --restart unless-stopped "$container_name" >/dev/null
+
+echo "Устанавливаю службу восстановления после загрузки ZimaOS..."
+cat > "$UPDATE_ROOT/recover_container.sh" <<'RECOVERY'
+#!/bin/sh
+set -eu
+CONTAINER="${DOCKER_CONTAINER:-ai-ch}"
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Docker CLI не найден; AI CH не запускался." >&2
+  exit 1
+fi
+
+if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
+  echo "Контейнер $CONTAINER не найден; восстановление пропущено." >&2
+  exit 0
+fi
+
+running=$(docker inspect --format='{{.State.Running}}' "$CONTAINER")
+if [ "$running" != "true" ]; then
+  echo "Контейнер $CONTAINER остановлен; запускаю его после старта Docker."
+  docker start "$CONTAINER" >/dev/null
+else
+  echo "Контейнер $CONTAINER уже запущен."
+fi
+RECOVERY
+chmod 755 "$UPDATE_ROOT/recover_container.sh"
+
+cat > /etc/systemd/system/ai-ch-recovery.service <<EOF
+[Unit]
+Description=Ensure AI CH container starts after ZimaOS boot
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/ai-ch-updater.env
+ExecStart=$UPDATE_ROOT/recover_container.sh
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 echo "Устанавливаю службу автоматических обновлений..."
 curl --fail --silent --show-error --location "$RAW_BASE/auto_deploy_daemon.py" \
   -o "$UPDATE_ROOT/auto_deploy_daemon.py"
@@ -251,6 +297,8 @@ WantedBy=timers.target
 EOF
 
 systemctl daemon-reload
+systemctl enable ai-ch-recovery.service
+systemctl start ai-ch-recovery.service
 systemctl enable --now ai-ch-updater.timer
 
 echo
