@@ -27,6 +27,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlsplit
 
 GITHUB_REPO = os.getenv("GITHUB_REPO", "vwxcc/deepseekw").strip()
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main").strip()
@@ -137,6 +138,24 @@ def github_headers(*, accept: str = "application/vnd.github+json") -> dict[str, 
     }
 
 
+class SafeGitHubArchiveRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Allow only HTTPS GitHub archive redirects and strip auth across hosts."""
+
+    ALLOWED_HOSTS = {"api.github.com", "codeload.github.com"}
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        source = urlsplit(req.full_url)
+        target = urlsplit(newurl)
+        if target.scheme != "https" or target.hostname not in self.ALLOWED_HOSTS:
+            raise urllib.error.URLError("GitHub returned an untrusted archive redirect.")
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None and source.hostname != target.hostname:
+            for name in list(redirected.headers):
+                if name.lower() in {"authorization", "proxy-authorization", "cookie"}:
+                    redirected.remove_header(name)
+        return redirected
+
+
 def github_http_error(exc: urllib.error.HTTPError, *, downloading: bool = False) -> RuntimeError:
     if exc.code == 401:
         message = "GitHub отклонил GITHUB_TOKEN: токен неверен, истёк или отозван."
@@ -180,7 +199,11 @@ def download_archive(sha: str, destination: Path) -> None:
         headers=github_headers(accept="application/vnd.github+json"),
     )
     try:
-        with urllib.request.urlopen(request, timeout=max(HTTP_TIMEOUT, 120)) as response:
+        with urllib.request.build_opener(SafeGitHubArchiveRedirectHandler()).open(
+            request, timeout=max(HTTP_TIMEOUT, 120)
+        ) as response:
+            if urlsplit(response.geturl()).hostname not in SafeGitHubArchiveRedirectHandler.ALLOWED_HOSTS:
+                raise RuntimeError("GitHub redirected the archive to an untrusted host.")
             content = response.read(100 * 1024 * 1024 + 1)
     except urllib.error.HTTPError as exc:
         raise github_http_error(exc, downloading=True) from exc
