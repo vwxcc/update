@@ -523,6 +523,17 @@ def _create_sandbox_container(key: str) -> None:
     work_host = APP_DATA_HOST / "sandbox"
     work_host.mkdir(parents=True, exist_ok=True)
     APP_ROOT_HOST.mkdir(parents=True, exist_ok=True)
+    sandbox_env_file = UPDATE_ROOT / ".sandbox-runner.env"
+    sandbox_env_file.parent.mkdir(parents=True, exist_ok=True)
+    sandbox_env_file.write_text(
+        "SANDBOX_API_KEY=" + key + "\n"
+        "SANDBOX_REQUIRE_AUTH=1\n"
+        "SANDBOX_PORT=8000\n"
+        "SANDBOX_WORK=/work\n"
+        "SANDBOX_CONCURRENCY=1\n",
+        encoding="utf-8",
+    )
+    os.chmod(sandbox_env_file, 0o600)
     run_cmd(
         [
             "docker", "create", "--name", SANDBOX_CONTAINER,
@@ -535,17 +546,14 @@ def _create_sandbox_container(key: str) -> None:
             "--cap-add=FOWNER",
             "--cap-add=SETUID",
             "--cap-add=SETGID",
+            "--cap-add=KILL",
             "--security-opt=no-new-privileges",
             "--pids-limit", "128",
             "--memory", "1g",
             "--cpus", "1.0",
             "--mount", f"type=bind,source={SANDBOX_RUNTIME_HOST},target=/srv,readonly",
             "--mount", f"type=bind,source={work_host},target=/work",
-            "--env", "SANDBOX_WORK=/work",
-            "--env", "SANDBOX_REQUIRE_AUTH=1",
-            "--env", "SANDBOX_PORT=8000",
-            "--env", f"SANDBOX_API_KEY={key}",
-            "--env", "SANDBOX_CONCURRENCY=1",
+            "--env-file", str(sandbox_env_file),
             "--env", "PYTHONPATH=/srv:/srv/site-packages",
             "--env", "PYTHONUNBUFFERED=1",
             "--env", "PYTHONDONTWRITEBYTECODE=1",
