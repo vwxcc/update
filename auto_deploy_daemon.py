@@ -746,6 +746,7 @@ def perform_update(sha: str, state: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError("Обновление отменено; предыдущая версия восстановлена." if restored else
                                "Обновление не прошло проверку, и автоматический откат не подтвердился.")
         state["applied_sha"] = sha
+        state["sandbox_app_restart_pending"] = False
         state["dependency_sha"] = dependency_sha
         state["requirements_sha"] = new_requirements_sha
         state["last_success"] = utc_now()
@@ -840,9 +841,12 @@ def main() -> int:
             if state.get("applied_sha") == latest:
                 sandbox_changed = ensure_sandbox_runner(latest, state)
                 if sandbox_changed:
+                    state["sandbox_app_restart_pending"] = True
+                if state.get("sandbox_app_restart_pending"):
                     write_state(state)
-                    LOG.info("Runner развёрнут; перезапускаю AI CH, чтобы он прочитал закрытый ключ песочницы.")
+                    LOG.info("Проверяю запуск AI CH после настройки закрытого runner и чтения секретного ключа.")
                     restart_app_after_sandbox_change()
+                    state["sandbox_app_restart_pending"] = False
                 state["last_error"] = None
                 write_state(state)
                 LOG.info("Изменений нет; приложение на версии %s, изолированная песочница проверена.", latest[:12])
