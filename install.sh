@@ -395,6 +395,8 @@ systemctl daemon-reload
 systemctl enable ai-ch-recovery.service
 systemctl start ai-ch-recovery.service
 systemctl enable --now ai-ch-updater.timer
+# This also deploys the separate locked-down runner on an existing AI CH install.
+systemctl start ai-ch-updater.service
 
 echo
 echo "Готово: AI CH установлен и отвечает на $HEALTH_URL"
@@ -407,4 +409,6 @@ echo "Статус: systemctl status ai-ch-updater.timer"
 echo "Логи приложения: docker logs --tail 100 $container_name"
 echo "Логи обновлятора: $UPDATE_ROOT/logs/updater.log"
 echo "Адрес: http://<IP-ZimaOS>:$health_port/"
-echo "Примечание: отдельная песочница кода не устанавливается этим сценарием."
+echo "Закрытая песочница: ai-ch-sandbox, внутренняя сеть Docker без портов на хосте."
+echo "Проверка: docker exec ai-ch-sandbox python -c \"import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read().decode())\""
+echo "Секрет runner хранится в $APP_ROOT/data/.sandbox_api_key (права 600)."
