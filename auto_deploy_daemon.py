@@ -491,10 +491,23 @@ def _sandbox_manifest_sha(source: Path) -> str:
 def _ensure_sandbox_network() -> None:
     if not SANDBOX_NETWORK or not SANDBOX_CONTAINER:
         raise RuntimeError("SANDBOX_CONTAINER/SANDBOX_NETWORK не заданы.")
-    inspected = run_cmd(["docker", "network", "inspect", SANDBOX_NETWORK], timeout=12, check=False)
+    inspected = run_cmd(
+        ["docker", "network", "inspect", "--format={{.Internal}}", SANDBOX_NETWORK],
+        timeout=12,
+        check=False,
+    )
     if inspected.returncode:
         run_cmd(["docker", "network", "create", "--internal", SANDBOX_NETWORK], timeout=30)
+        inspected = run_cmd(
+            ["docker", "network", "inspect", "--format={{.Internal}}", SANDBOX_NETWORK],
+            timeout=12,
+        )
         LOG.info("Создана внутренняя Docker-сеть %s без внешнего маршрута.", SANDBOX_NETWORK)
+    if inspected.stdout.strip().lower() != "true":
+        raise RuntimeError(
+            f"Docker-сеть {SANDBOX_NETWORK} существует, но не помечена Internal; "
+            "закрытая песочница не будет запущена в потенциально внешней сети."
+        )
     if SANDBOX_NETWORK not in _docker_container_networks(DOCKER_CONTAINER):
         run_cmd(["docker", "network", "connect", SANDBOX_NETWORK, DOCKER_CONTAINER], timeout=20)
         LOG.info("AI CH подключён к внутренней сети песочницы.")
