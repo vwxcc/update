@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import shutil
+import secrets
 import subprocess
 import sys
 import tarfile
@@ -40,6 +41,12 @@ HEALTH_TIMEOUT = max(15, int(os.getenv("HEALTH_TIMEOUT", "90")))
 HTTP_TIMEOUT = max(5, int(os.getenv("HTTP_TIMEOUT", "25")))
 KEEP_RELEASES = max(2, min(10, int(os.getenv("KEEP_RELEASES", "3"))))
 UPDATE_ROOT = Path(os.getenv("UPDATE_ROOT", "/DATA/AppData/ai-ch-updater")).expanduser()
+APP_DATA_HOST = Path(os.getenv("AI_CH_DATA_HOST", "/DATA/AppData/ai-ch/data")).expanduser()
+APP_ROOT_HOST = Path(os.getenv("AI_CH_APP_ROOT", "/DATA/AppData/ai-ch")).expanduser()
+SANDBOX_CONTAINER = os.getenv("SANDBOX_CONTAINER", "ai-ch-sandbox").strip()
+SANDBOX_NETWORK = os.getenv("SANDBOX_NETWORK", "ai-ch-sandbox-internal").strip()
+SANDBOX_RUNTIME_HOST = APP_ROOT_HOST / "sandbox-runtime"
+SANDBOX_SECRET_FILE = APP_DATA_HOST / ".sandbox_api_key"
 API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/commits/{GITHUB_BRANCH}"
 ARCHIVE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/tarball/"
 USER_AGENT = "ai-ch-zimaos-updater/1.0"
@@ -216,7 +223,7 @@ def download_archive(sha: str, destination: Path) -> None:
 
 def extract_release(archive: Path, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
-    allowed_top = {"app", "frontend", REQUIREMENTS_FILENAME}
+    allowed_top = {"app", "frontend", "sandbox", REQUIREMENTS_FILENAME}
     allowed_files = 0
     with tarfile.open(archive, mode="r:gz") as tar:
         members = tar.getmembers()
@@ -256,13 +263,16 @@ def validate_release(path: Path) -> None:
         path / "app" / "main.py",
         path / "frontend" / "index.html",
         path / REQUIREMENTS_FILENAME,
+        path / "sandbox" / "server.py",
+        path / "sandbox" / "requirements.txt",
     ]
     missing = [str(item.relative_to(path)) for item in required if not item.is_file()]
     if missing:
         raise RuntimeError("Релиз неполный; отсутствуют: " + ", ".join(missing))
     python_files = list((path / "app").rglob("*.py"))
+    python_files.extend((path / "sandbox").rglob("*.py"))
     if not python_files:
-        raise RuntimeError("В релизе нет Python-файлов приложения.")
+        raise RuntimeError("В релизе нет Python-файлов приложения/песочницы.")
     for file_path in python_files:
         try:
             ast.parse(file_path.read_text(encoding="utf-8"), filename=str(file_path))
@@ -425,6 +435,255 @@ def prune_releases(applied_sha: str, remote_sha: str) -> None:
             shutil.rmtree(item, ignore_errors=True)
 
 
+
+def _docker_container_exists(name: str) -> bool:
+    return run_cmd(["docker", "inspect", name], timeout=12, check=False).returncode == 0
+
+
+def _docker_container_networks(name: str) -> set[str]:
+    result = run_cmd(
+        ["docker", "inspect", "--format={{json .NetworkSettings.Networks}}", name],
+        timeout=12,
+        check=False,
+    )
+    if result.returncode:
+        return set()
+    try:
+        data = json.loads(result.stdout.strip() or "{}")
+        return set(data) if isinstance(data, dict) else set()
+    except json.JSONDecodeError:
+        return set()
+
+
+def _sandbox_healthy() -> bool:
+    state = run_cmd(
+        ["docker", "inspect", "--format={{.State.Running}}", SANDBOX_CONTAINER],
+        timeout=12,
+        check=False,
+    )
+    if state.returncode or state.stdout.strip().lower() != "true":
+        return False
+    health = run_cmd(
+        [
+            "docker", "exec", SANDBOX_CONTAINER, "python", "-c",
+            "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read().decode())",
+        ],
+        timeout=10,
+        check=False,
+    )
+    return health.returncode == 0 and '"ok": true' in health.stdout
+
+
+def _sandbox_manifest_sha(source: Path) -> str:
+    digest = hashlib.sha256()
+    for item in sorted(p for p in source.rglob("*") if p.is_file()):
+        if "__pycache__" in item.parts or item.suffix == ".pyc":
+            continue
+        digest.update(item.relative_to(source).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        with item.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _ensure_sandbox_network() -> None:
+    if not SANDBOX_NETWORK or not SANDBOX_CONTAINER:
+        raise RuntimeError("SANDBOX_CONTAINER/SANDBOX_NETWORK не заданы.")
+    inspected = run_cmd(
+        ["docker", "network", "inspect", "--format={{.Internal}}", SANDBOX_NETWORK],
+        timeout=12,
+        check=False,
+    )
+    if inspected.returncode:
+        run_cmd(["docker", "network", "create", "--internal", SANDBOX_NETWORK], timeout=30)
+        inspected = run_cmd(
+            ["docker", "network", "inspect", "--format={{.Internal}}", SANDBOX_NETWORK],
+            timeout=12,
+        )
+        LOG.info("Создана внутренняя Docker-сеть %s без внешнего маршрута.", SANDBOX_NETWORK)
+    if inspected.stdout.strip().lower() != "true":
+        raise RuntimeError(
+            f"Docker-сеть {SANDBOX_NETWORK} существует, но не помечена Internal; "
+            "закрытая песочница не будет запущена в потенциально внешней сети."
+        )
+    if SANDBOX_NETWORK not in _docker_container_networks(DOCKER_CONTAINER):
+        run_cmd(["docker", "network", "connect", SANDBOX_NETWORK, DOCKER_CONTAINER], timeout=20)
+        LOG.info("AI CH подключён к внутренней сети песочницы.")
+
+
+def _sandbox_key() -> str:
+    APP_DATA_HOST.mkdir(parents=True, exist_ok=True)
+    try:
+        value = SANDBOX_SECRET_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        value = ""
+    if not value:
+        value = secrets.token_urlsafe(48)
+        tmp = SANDBOX_SECRET_FILE.with_name(SANDBOX_SECRET_FILE.name + ".tmp")
+        tmp.write_text(value + "\n", encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, SANDBOX_SECRET_FILE)
+        os.chmod(SANDBOX_SECRET_FILE, 0o600)
+        LOG.info("Создан общий секрет приложения/песочницы в закрытом файле данных (значение не журналируется).")
+    elif SANDBOX_SECRET_FILE.exists():
+        os.chmod(SANDBOX_SECRET_FILE, 0o600)
+    return value
+
+
+def _create_sandbox_container(key: str) -> None:
+    work_host = APP_DATA_HOST / "sandbox"
+    work_host.mkdir(parents=True, exist_ok=True)
+    APP_ROOT_HOST.mkdir(parents=True, exist_ok=True)
+    sandbox_env_file = UPDATE_ROOT / ".sandbox-runner.env"
+    sandbox_env_file.parent.mkdir(parents=True, exist_ok=True)
+    sandbox_env_file.write_text(
+        "SANDBOX_API_KEY=" + key + "\n"
+        "SANDBOX_REQUIRE_AUTH=1\n"
+        "SANDBOX_PORT=8000\n"
+        "SANDBOX_WORK=/work\n"
+        "SANDBOX_CONCURRENCY=1\n",
+        encoding="utf-8",
+    )
+    os.chmod(sandbox_env_file, 0o600)
+    run_cmd(
+        [
+            "docker", "create", "--name", SANDBOX_CONTAINER,
+            "--restart", "unless-stopped",
+            "--network", SANDBOX_NETWORK,
+            "--read-only",
+            "--tmpfs", "/tmp:rw,nosuid,size=128m",
+            "--cap-drop=ALL",
+            "--cap-add=CHOWN",
+            "--cap-add=FOWNER",
+            "--cap-add=SETUID",
+            "--cap-add=SETGID",
+            "--cap-add=KILL",
+            "--security-opt=no-new-privileges",
+            "--pids-limit", "128",
+            "--memory", "1g",
+            "--cpus", "1.0",
+            "--mount", f"type=bind,source={SANDBOX_RUNTIME_HOST},target=/srv,readonly",
+            "--mount", f"type=bind,source={work_host},target=/work",
+            "--env-file", str(sandbox_env_file),
+            "--env", "PYTHONPATH=/srv:/srv/site-packages",
+            "--env", "PYTHONUNBUFFERED=1",
+            "--env", "PYTHONDONTWRITEBYTECODE=1",
+            "python:3.12-slim",
+            "python", "/srv/server.py",
+        ],
+        timeout=30,
+    )
+    run_cmd(["docker", "start", SANDBOX_CONTAINER], timeout=30)
+
+
+def ensure_sandbox_runner(sha: str, state: dict[str, Any], release: Path | None = None) -> bool:
+    """Install/update the closed runner beside AI CH. Returns True when it changed."""
+    if not docker_running():
+        raise RuntimeError("Нельзя подключить песочницу: контейнер AI CH не запущен.")
+    if release is None or not (release / "sandbox" / "server.py").is_file():
+        releases = UPDATE_ROOT / "releases"
+        releases.mkdir(parents=True, exist_ok=True)
+        release = releases / sha
+        if not release.exists():
+            archive_file = UPDATE_ROOT / f".sandbox-source-{sha}.tar.gz"
+            try:
+                LOG.info("Скачиваю фиксированный исходный код песочницы из %s (%s).", GITHUB_REPO, sha[:12])
+                download_archive(sha, archive_file)
+                extract_release(archive_file, release)
+            finally:
+                archive_file.unlink(missing_ok=True)
+        else:
+            validate_release(release)
+
+    source = release / "sandbox"
+    if not (source / "server.py").is_file() or not (source / "requirements.txt").is_file():
+        raise RuntimeError("В релизе отсутствуют sandbox/server.py или sandbox/requirements.txt.")
+    if not (source / "designs").is_dir():
+        raise RuntimeError("В релизе отсутствует каталог sandbox/designs.")
+
+    manifest_sha = _sandbox_manifest_sha(source)
+    key = _sandbox_key()
+    _ensure_sandbox_network()
+    if (
+        state.get("sandbox_manifest_sha") == manifest_sha
+        and _sandbox_healthy()
+        and SANDBOX_SECRET_FILE.is_file()
+    ):
+        return False
+
+    stage = APP_ROOT_HOST / f".sandbox-runtime-stage-{sha[:12]}"
+    backup = APP_ROOT_HOST / f".sandbox-runtime-backup-{int(time.time())}"
+    shutil.rmtree(stage, ignore_errors=True)
+    shutil.copytree(
+        source, stage,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache", ".mypy_cache"),
+    )
+    (stage / "site-packages").mkdir(parents=True, exist_ok=True)
+    image = run_cmd(["docker", "image", "inspect", "python:3.12-slim"], timeout=15, check=False)
+    if image.returncode:
+        LOG.info("Скачиваю базовый образ Python для изолированного runner.")
+        run_cmd(["docker", "pull", "python:3.12-slim"], timeout=600)
+    LOG.info("Устанавливаю зафиксированные зависимости только в runtime песочницы.")
+    run_cmd(
+        [
+            "docker", "run", "--rm", "--network", "bridge",
+            "--mount", f"type=bind,source={stage},target=/srv",
+            "--workdir", "/srv",
+            "python:3.12-slim",
+            "python", "-m", "pip", "install", "--disable-pip-version-check",
+            "--no-cache-dir", "--target", "/srv/site-packages",
+            "-r", "/srv/requirements.txt",
+        ],
+        timeout=900,
+    )
+
+    had_old_runtime = SANDBOX_RUNTIME_HOST.exists()
+    had_old_container = _docker_container_exists(SANDBOX_CONTAINER)
+    if had_old_container:
+        run_cmd(["docker", "rm", "-f", SANDBOX_CONTAINER], timeout=30, check=False)
+    if had_old_runtime:
+        if backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+        os.replace(SANDBOX_RUNTIME_HOST, backup)
+    try:
+        os.replace(stage, SANDBOX_RUNTIME_HOST)
+        _create_sandbox_container(key)
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            if _sandbox_healthy():
+                state["sandbox_manifest_sha"] = manifest_sha
+                state["sandbox_source_sha"] = sha
+                state["sandbox_container"] = SANDBOX_CONTAINER
+                LOG.info("Закрытая песочница обновлена: internal network, no port publishing, read-only runtime, seccomp network block.")
+                shutil.rmtree(backup, ignore_errors=True)
+                return True
+            time.sleep(1)
+        raise RuntimeError("Новый runner не прошёл локальную health-проверку за 45 секунд.")
+    except Exception:
+        LOG.exception("Не удалось запустить новый runner; выполняю откат песочницы.")
+        run_cmd(["docker", "rm", "-f", SANDBOX_CONTAINER], timeout=30, check=False)
+        shutil.rmtree(SANDBOX_RUNTIME_HOST, ignore_errors=True)
+        if had_old_runtime and backup.exists():
+            os.replace(backup, SANDBOX_RUNTIME_HOST)
+            try:
+                _create_sandbox_container(key)
+                if not _sandbox_healthy():
+                    LOG.error("Предыдущая песочница восстановлена, но health-check не прошёл.")
+            except Exception:
+                LOG.exception("Не удалось повторно запустить предыдущую песочницу.")
+        raise
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def restart_app_after_sandbox_change() -> None:
+    run_cmd(["docker", "restart", DOCKER_CONTAINER], timeout=60)
+    if not wait_for_health():
+        raise RuntimeError("AI CH не прошёл health-check после подключения секретного ключа песочницы.")
+
+
 def perform_update(sha: str, state: dict[str, Any]) -> dict[str, Any]:
     if TARGET_MODE != "docker":
         raise RuntimeError("Поддерживается TARGET_MODE=docker. Другой режим не реализован в этой версии.")
@@ -473,6 +732,9 @@ def perform_update(sha: str, state: dict[str, Any]) -> dict[str, Any]:
         else:
             LOG.info("requirements.txt не изменился — зависимости не устанавливаются.")
 
+        # Provision/update the isolated runner while the web app still serves.
+        # The app's subsequent restart loads the secret from /app/data/.sandbox_api_key.
+        ensure_sandbox_runner(sha, state, release)
         # The existing process keeps serving until all validation and downloads are done.
         container_stop_if_running()
         app_was_stopped = True
@@ -497,6 +759,7 @@ def perform_update(sha: str, state: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError("Обновление отменено; предыдущая версия восстановлена." if restored else
                                "Обновление не прошло проверку, и автоматический откат не подтвердился.")
         state["applied_sha"] = sha
+        state["sandbox_app_restart_pending"] = False
         state["dependency_sha"] = dependency_sha
         state["requirements_sha"] = new_requirements_sha
         state["last_success"] = utc_now()
@@ -589,9 +852,17 @@ def main() -> int:
             state["etag"] = etag
             state["last_check"] = utc_now()
             if state.get("applied_sha") == latest:
+                sandbox_changed = ensure_sandbox_runner(latest, state)
+                if sandbox_changed:
+                    state["sandbox_app_restart_pending"] = True
+                if state.get("sandbox_app_restart_pending"):
+                    write_state(state)
+                    LOG.info("Проверяю запуск AI CH после настройки закрытого runner и чтения секретного ключа.")
+                    restart_app_after_sandbox_change()
+                    state["sandbox_app_restart_pending"] = False
                 state["last_error"] = None
                 write_state(state)
-                LOG.info("Изменений нет; установлена последняя версия %s. Перезапуск не нужен.", latest[:12])
+                LOG.info("Изменений нет; приложение на версии %s, изолированная песочница проверена.", latest[:12])
                 prune_releases(latest, latest)
                 return 0
             if state.get("failed_sha") == latest:
