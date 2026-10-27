@@ -223,7 +223,7 @@ def download_archive(sha: str, destination: Path) -> None:
 
 def extract_release(archive: Path, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
-    allowed_top = {"app", "frontend", REQUIREMENTS_FILENAME}
+    allowed_top = {"app", "frontend", "sandbox", REQUIREMENTS_FILENAME}
     allowed_files = 0
     with tarfile.open(archive, mode="r:gz") as tar:
         members = tar.getmembers()
@@ -263,13 +263,16 @@ def validate_release(path: Path) -> None:
         path / "app" / "main.py",
         path / "frontend" / "index.html",
         path / REQUIREMENTS_FILENAME,
+        path / "sandbox" / "server.py",
+        path / "sandbox" / "requirements.txt",
     ]
     missing = [str(item.relative_to(path)) for item in required if not item.is_file()]
     if missing:
         raise RuntimeError("Релиз неполный; отсутствуют: " + ", ".join(missing))
     python_files = list((path / "app").rglob("*.py"))
+    python_files.extend((path / "sandbox").rglob("*.py"))
     if not python_files:
-        raise RuntimeError("В релизе нет Python-файлов приложения.")
+        raise RuntimeError("В релизе нет Python-файлов приложения/песочницы.")
     for file_path in python_files:
         try:
             ast.parse(file_path.read_text(encoding="utf-8"), filename=str(file_path))
@@ -708,6 +711,9 @@ def perform_update(sha: str, state: dict[str, Any]) -> dict[str, Any]:
         else:
             LOG.info("requirements.txt не изменился — зависимости не устанавливаются.")
 
+        # Provision/update the isolated runner while the web app still serves.
+        # The app's subsequent restart loads the secret from /app/data/.sandbox_api_key.
+        ensure_sandbox_runner(sha, state, release)
         # The existing process keeps serving until all validation and downloads are done.
         container_stop_if_running()
         app_was_stopped = True
@@ -824,9 +830,14 @@ def main() -> int:
             state["etag"] = etag
             state["last_check"] = utc_now()
             if state.get("applied_sha") == latest:
+                sandbox_changed = ensure_sandbox_runner(latest, state)
+                if sandbox_changed:
+                    write_state(state)
+                    LOG.info("Runner развёрнут; перезапускаю AI CH, чтобы он прочитал закрытый ключ песочницы.")
+                    restart_app_after_sandbox_change()
                 state["last_error"] = None
                 write_state(state)
-                LOG.info("Изменений нет; установлена последняя версия %s. Перезапуск не нужен.", latest[:12])
+                LOG.info("Изменений нет; приложение на версии %s, изолированная песочница проверена.", latest[:12])
                 prune_releases(latest, latest)
                 return 0
             if state.get("failed_sha") == latest:
