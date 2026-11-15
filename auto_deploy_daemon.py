@@ -404,7 +404,13 @@ def container_start() -> None:
     run_cmd(["docker", "start", DOCKER_CONTAINER], timeout=40)
 
 
-def rollback(backup: Path, state: dict[str, Any], site_packages: str, work_dir: Path) -> bool:
+def rollback(
+    backup: Path,
+    state: dict[str, Any],
+    site_packages: str,
+    work_dir: Path,
+    failed_release: Path | None = None,
+) -> bool:
     LOG.error("Откат: возвращаю предыдущие app/frontend/requirements.txt и выбор зависимостей.")
     try:
         container_stop_if_running()
@@ -414,6 +420,9 @@ def rollback(backup: Path, state: dict[str, Any], site_packages: str, work_dir: 
         replace_app_files(backup)
         write_dependency_pointer(state.get("dependency_sha"), site_packages, work_dir)
         container_start()
+        if failed_release is not None:
+            # Drop files introduced by the rejected release before accepting rollback.
+            prune_removed_files(failed_release, backup)
         if wait_for_health():
             LOG.warning("Откат завершён; предыдущая версия отвечает на health-check.")
             return True
@@ -468,15 +477,18 @@ def prune_removed_files(previous_root: Path, release_root: Path) -> None:
         "[(os.remove(p) if os.path.isfile(p) or os.path.islink(p) else None) "
         "for p in sys.argv[1:]]"
     )
-    result = docker_exec("python", "-c", cleanup_script, *stale, timeout=90, check=False)
-    if result.returncode:
-        LOG.warning(
-            "Не удалось полностью удалить %s устаревших файлов исходного кода: %s",
-            len(stale),
-            (result.stderr or result.stdout).strip()[-500:],
-        )
-    else:
-        LOG.info("Удалено устаревших файлов из app/frontend: %s.", len(stale))
+    try:
+        result = docker_exec("python", "-c", cleanup_script, *stale, timeout=90, check=False)
+        if result.returncode:
+            LOG.warning(
+                "Не удалось полностью удалить %s устаревших файлов исходного кода: %s",
+                len(stale),
+                (result.stderr or result.stdout).strip()[-500:],
+            )
+        else:
+            LOG.info("Удалено устаревших файлов из app/frontend: %s.", len(stale))
+    except Exception as exc:
+        LOG.warning("Очистка устаревших исходных файлов пропущена: %s", exc)
 
 def perform_update(sha: str, state: dict[str, Any]) -> dict[str, Any]:
     if TARGET_MODE != "docker":
@@ -538,7 +550,7 @@ def perform_update(sha: str, state: dict[str, Any]) -> dict[str, Any]:
             # If restoring old files fails because the new code is crashing, docker
             # cp still works against a stopped container; the pointer is restored
             # before starting the old code again.
-            restored = rollback(backup, state, site_packages, work_dir)
+            restored = rollback(backup, state, site_packages, work_dir, release)
             state["failed_sha"] = sha
             state["failed_updater_version"] = UPDATER_VERSION
             state["last_error"] = "внутренняя health-проверка новой версии не пройдена"
