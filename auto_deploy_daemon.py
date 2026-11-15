@@ -342,6 +342,49 @@ def prepare_dependency_set(remote_stage: str, sha: str, release: Path, requireme
     return sha
 
 
+
+def smoke_test_release(remote_stage: str, dependency_sha: str | None) -> None:
+    """Import the staged app and execute FastAPI lifespan without touching live data."""
+    dependency_path = f"/opt/ai-ch-deps/{dependency_sha}" if dependency_sha else ""
+    script = f"""
+import asyncio
+import sys
+sys.path.insert(0, {remote_stage!r})
+if {dependency_path!r}:
+    sys.path.insert(0, {dependency_path!r})
+from app.main import app
+
+async def check_startup():
+    async with app.router.lifespan_context(app):
+        pass
+
+asyncio.run(check_startup())
+print("AI CH staged import/startup check: OK")
+"""
+    LOG.info("Проверяю импорт новой версии и startup FastAPI в изолированной рабочей папке.")
+    result = run_cmd(
+        [
+            "docker", "exec",
+            "-w", remote_stage,
+            DOCKER_CONTAINER,
+            "env", "-i",
+            "PATH=/usr/local/bin:/usr/bin:/bin",
+            "PYTHONUNBUFFERED=1",
+            "PYTHONDONTWRITEBYTECODE=1",
+            "python", "-c", script,
+        ],
+        timeout=120,
+        check=False,
+    )
+    if result.returncode:
+        details = (result.stderr or result.stdout or f"exit code {result.returncode}").strip()
+        LOG.error("Новая версия не прошла предварительный импорт/startup check: %s", details[-5000:])
+        raise RuntimeError(
+            "Новая версия не прошла предварительную проверку импорта/startup. "
+            "Работающий контейнер не останавливался; подробности в логе updater."
+        )
+    LOG.info("Предварительная проверка импорта и startup пройдена: %s.", result.stdout.strip()[-500:])
+
 def replace_app_files(source_root: Path) -> None:
     # docker cp can write to a stopped container. Copy directory contents into
     # the already-existing destinations; this also lets rollback work when the
@@ -535,6 +578,10 @@ def perform_update(sha: str, state: dict[str, Any]) -> dict[str, Any]:
             dependency_changed = True
         else:
             LOG.info("requirements.txt не изменился — зависимости не устанавливаются.")
+
+        # Import and run the app startup in a temporary cwd with a cleared environment.
+        # Its default SQLite database is created under the staging directory, never /app/data.
+        smoke_test_release(remote_stage, dependency_sha if dependency_changed else None)
 
         # The existing process keeps serving until all validation and downloads are done.
         container_stop_if_running()
