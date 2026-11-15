@@ -240,7 +240,7 @@ if [ "$container_exists" = "false" ]; then
     session_secret=$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')
     cat > "$APP_ROOT/.env" <<EOF
 APP_NAME=AI CH
-SESSION_SECRET=$session_secret
+SECRET_KEY=$session_secret
 ADMIN_EMAIL=$admin_email
 ADMIN_PASSWORD=$admin_password
 RUN_SANDBOX_ENABLED=0
