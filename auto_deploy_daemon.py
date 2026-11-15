@@ -586,7 +586,7 @@ def perform_update(sha: str, state: dict[str, Any]) -> dict[str, Any]:
         if app_was_stopped:
             LOG.exception("Ошибка во время переключения версии.")
             try:
-                rollback(backup, state, site_packages, work_dir)
+                rollback(backup, state, site_packages, work_dir, release)
             except Exception:
                 LOG.exception("Не удалось выполнить резервный откат.")
         raise
