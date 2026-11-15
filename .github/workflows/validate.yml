@@ -33,4 +33,6 @@ jobs:
           grep -F 'SafeGitHubArchiveRedirectHandler' auto_deploy_daemon.py
           grep -F 'ai-ch-mega' auto_deploy_daemon.py
           grep -F 'CONTAINER_PORT=8000' install.sh
+          grep -F 'SECRET_KEY=$session_secret' install.sh
+          ! grep -F 'SESSION_SECRET=$session_secret' install.sh
           ! grep -F 'sandbox/server.py' auto_deploy_daemon.py
