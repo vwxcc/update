@@ -620,6 +620,14 @@ def prune_backups(current: Path) -> None:
             shutil.rmtree(item, ignore_errors=True)
 
 
+def failed_commit_for_current_updater(state: dict[str, Any], sha: str) -> bool:
+    """Only suppress retries after this updater version has already rejected the SHA."""
+    return (
+        state.get("failed_sha") == sha
+        and state.get("failed_updater_version") == UPDATER_VERSION
+    )
+
+
 def main() -> int:
     global LOG
     UPDATE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -648,10 +656,7 @@ def main() -> int:
                 LOG.info("Изменений нет; приложение уже на версии %s.", latest[:12])
                 prune_releases(latest, latest)
                 return 0
-            if (
-                state.get("failed_sha") == latest
-                and state.get("failed_updater_version") == UPDATER_VERSION
-            ):
+            if failed_commit_for_current_updater(state, latest):
                 write_state(state)
                 LOG.warning(
                     "Коммит %s уже не прошёл проверку на версии updater %s. "
