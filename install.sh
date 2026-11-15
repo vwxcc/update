@@ -98,8 +98,8 @@ detect_existing_container() {
 }
 
 detected_container=$(detect_existing_container)
-default_container=${DOCKER_CONTAINER:-$detected_container}
-[ -n "$default_container" ] || default_container=ai-ch-mega
+default_container=$detected_container
+[ -n "$default_container" ] || default_container=${DOCKER_CONTAINER:-ai-ch-mega}
 printf "Контейнер AI CH [%s]: " "$default_container"
 read -r container_name || true
 [ -n "$container_name" ] || container_name=$default_container
@@ -134,10 +134,15 @@ if [ "$container_exists" = "true" ]; then
     exit 1
   fi
   detected_port=$(detect_published_port)
-  default_port=${detected_port:-3050}
-  printf "Внешний порт (уже опубликованный Docker-порт не меняется) [%s]: " "$default_port"
-  read -r health_port || true
-  [ -n "$health_port" ] || health_port=$default_port
+  if [ -n "$detected_port" ]; then
+    health_port=$detected_port
+    echo "У контейнера $container_name уже опубликован порт $health_port; не меняю его."
+  else
+    default_port=3050
+    printf "На хосте не найден проброс 8000/tcp. Порт для ссылки [%s]: " "$default_port"
+    read -r health_port || true
+    [ -n "$health_port" ] || health_port=$default_port
+  fi
   echo "Найден существующий контейнер $container_name: сохраняю его, .env, mounts, data и uploads."
 else
   default_port=3050
