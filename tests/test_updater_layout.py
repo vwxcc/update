@@ -24,7 +24,18 @@ class CurrentReleaseLayoutTests(unittest.TestCase):
         (sandbox / "designs").mkdir(parents=True)
         (sandbox / "fonts").mkdir()
         (sandbox / "Dockerfile").write_text("FROM python:3.12-slim\n", encoding="utf-8")
-        (sandbox / "server.py").write_text("print(1)\n", encoding="utf-8")
+        (sandbox / "server.py").write_text(
+            "import os\n"
+            "def _sandbox_api_key():\n"
+            "    return os.environ.get(\"SANDBOX_API_KEY_FILE\", \"\")\n"
+            "class Handler:\n"
+            "    def do_GET(self):\n"
+            "        path = \"/ready\"\n"
+            "        if path == \"/ready\":\n"
+            "            if not self._authorized():\n"
+            "                self._json(401, {})\n",
+            encoding="utf-8",
+        )
         (sandbox / "requirements.txt").write_text("httpx==0.28.1\n", encoding="utf-8")
         (sandbox / "designs" / "__init__.py").write_text("", encoding="utf-8")
         (sandbox / "fonts" / "placeholder.txt").write_text("font asset\n", encoding="utf-8")

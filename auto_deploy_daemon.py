@@ -274,6 +274,19 @@ def validate_release(path: Path) -> None:
     for directory in (path / "sandbox" / "designs", path / "sandbox" / "fonts"):
         if not directory.is_dir():
             raise RuntimeError("Релиз песочницы неполный; отсутствует каталог: " + str(directory.relative_to(path)))
+    runner_source = (path / "sandbox" / "server.py").read_text(encoding="utf-8")
+    runner_contract = (
+        "def _sandbox_api_key()",
+        "SANDBOX_API_KEY_FILE",
+        'if path == "/ready":',
+        "if not self._authorized():",
+    )
+    missing_runner_contract = [token for token in runner_contract if token not in runner_source]
+    if missing_runner_contract:
+        raise RuntimeError(
+            "sandbox/server.py несовместим с updater v7: требуется чтение SANDBOX_API_KEY_FILE "
+            "и аутентифицированный /ready. Сначала слейте PR #298; runner не запускался."
+        )
     python_files = (
         list((path / "app").rglob("*.py"))
         + list((path / "tests").rglob("*.py"))
