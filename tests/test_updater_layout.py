@@ -15,9 +15,19 @@ class CurrentReleaseLayoutTests(unittest.TestCase):
     def make_release(self, root: Path) -> None:
         (root / "app").mkdir(parents=True)
         (root / "frontend").mkdir(parents=True)
+        tests = root / "tests"
+        tests.mkdir(parents=True)
         (root / "app" / "main.py").write_text("app = object()\n", encoding="utf-8")
         (root / "frontend" / "index.html").write_text("<!doctype html>\n", encoding="utf-8")
         (root / "requirements.txt").write_text("fastapi==0.115.6\n", encoding="utf-8")
+        for name in (
+            "test_scheduled.py",
+            "test_auth_contract.py",
+            "test_chats_search.py",
+            "test_frontend_build.py",
+            "test_database_migrations.py",
+        ):
+            (tests / name).write_text("import unittest\n", encoding="utf-8")
 
     def test_release_without_sandbox_is_valid(self):
         with tempfile.TemporaryDirectory() as temp:
