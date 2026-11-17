@@ -37,7 +37,7 @@ DOCKER_CONTAINER = os.getenv("DOCKER_CONTAINER", "ai-ch-mega").strip()
 APP_DIR = os.getenv("APP_DIR", "/app").rstrip("/")
 HEALTH_URL = os.getenv("HEALTH_URL", "http://127.0.0.1:3050/api/health").strip()
 CONTAINER_PORT = max(1, min(65535, int(os.getenv("CONTAINER_PORT", "8000"))))
-UPDATER_VERSION = 5
+UPDATER_VERSION = 6
 HEALTH_TIMEOUT = max(15, int(os.getenv("HEALTH_TIMEOUT", "90")))
 HTTP_TIMEOUT = max(5, int(os.getenv("HTTP_TIMEOUT", "25")))
 KEEP_RELEASES = max(2, min(10, int(os.getenv("KEEP_RELEASES", "3"))))
@@ -263,6 +263,7 @@ def validate_release(path: Path) -> None:
         path / "tests" / "test_chats_search.py",
         path / "tests" / "test_frontend_build.py",
         path / "tests" / "test_database_migrations.py",
+        path / "tests" / "test_sandbox_runtime.py",
     ]
     missing = [str(item.relative_to(path)) for item in required if not item.is_file()]
     if missing:
@@ -437,6 +438,7 @@ patterns = (
     "test_chats_search.py",
     "test_frontend_build.py",
     "test_database_migrations.py",
+    "test_sandbox_runtime.py",
 )
 loader = unittest.TestLoader()
 suite = unittest.TestSuite()
