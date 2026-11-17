@@ -264,6 +264,8 @@ def validate_release(path: Path) -> None:
         path / "tests" / "test_frontend_build.py",
         path / "tests" / "test_database_migrations.py",
         path / "tests" / "test_sandbox_runtime.py",
+        path / "tests" / "test_tool_commands.py",
+        path / "tests" / "test_completion_ui.py",
         path / "sandbox" / "Dockerfile",
         path / "sandbox" / "server.py",
         path / "sandbox" / "requirements.txt",
@@ -462,6 +464,8 @@ patterns = (
     "test_frontend_build.py",
     "test_database_migrations.py",
     "test_sandbox_runtime.py",
+    "test_tool_commands.py",
+    "test_completion_ui.py",
 )
 loader = unittest.TestLoader()
 suite = unittest.TestSuite()

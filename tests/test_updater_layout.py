@@ -46,6 +46,8 @@ class CurrentReleaseLayoutTests(unittest.TestCase):
             "test_frontend_build.py",
             "test_database_migrations.py",
             "test_sandbox_runtime.py",
+            "test_tool_commands.py",
+            "test_completion_ui.py",
         ):
             (tests / name).write_text("import unittest\n", encoding="utf-8")
 
