@@ -35,4 +35,6 @@ jobs:
           grep -F 'CONTAINER_PORT=8000' install.sh
           grep -F 'SECRET_KEY=$session_secret' install.sh
           ! grep -F 'SESSION_SECRET=$session_secret' install.sh
-          ! grep -F 'sandbox/server.py' auto_deploy_daemon.py
+          grep -F 'SANDBOX_CONTAINER = "ai-ch-sandbox"' auto_deploy_daemon.py
+          grep -F 'no-new-privileges' auto_deploy_daemon.py
+          grep -F 'server.py' auto_deploy_daemon.py
