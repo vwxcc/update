@@ -37,7 +37,7 @@ DOCKER_CONTAINER = os.getenv("DOCKER_CONTAINER", "ai-ch-mega").strip()
 APP_DIR = os.getenv("APP_DIR", "/app").rstrip("/")
 HEALTH_URL = os.getenv("HEALTH_URL", "http://127.0.0.1:3050/api/health").strip()
 CONTAINER_PORT = max(1, min(65535, int(os.getenv("CONTAINER_PORT", "8000"))))
-UPDATER_VERSION = 4
+UPDATER_VERSION = 5
 HEALTH_TIMEOUT = max(15, int(os.getenv("HEALTH_TIMEOUT", "90")))
 HTTP_TIMEOUT = max(5, int(os.getenv("HTTP_TIMEOUT", "25")))
 KEEP_RELEASES = max(2, min(10, int(os.getenv("KEEP_RELEASES", "3"))))
@@ -218,7 +218,7 @@ def download_archive(sha: str, destination: Path) -> None:
 
 def extract_release(archive: Path, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
-    allowed_top = {"app", "frontend", REQUIREMENTS_FILENAME}
+    allowed_top = {"app", "frontend", "tests", REQUIREMENTS_FILENAME}
     allowed_files = 0
     with tarfile.open(archive, mode="r:gz") as tar:
         members = tar.getmembers()
@@ -258,11 +258,16 @@ def validate_release(path: Path) -> None:
         path / "app" / "main.py",
         path / "frontend" / "index.html",
         path / REQUIREMENTS_FILENAME,
+        path / "tests" / "test_scheduled.py",
+        path / "tests" / "test_auth_contract.py",
+        path / "tests" / "test_chats_search.py",
+        path / "tests" / "test_frontend_build.py",
+        path / "tests" / "test_database_migrations.py",
     ]
     missing = [str(item.relative_to(path)) for item in required if not item.is_file()]
     if missing:
         raise RuntimeError("Релиз неполный; отсутствуют: " + ", ".join(missing))
-    python_files = list((path / "app").rglob("*.py"))
+    python_files = list((path / "app").rglob("*.py")) + list((path / "tests").rglob("*.py"))
     if not python_files:
         raise RuntimeError("В релизе нет Python-файлов приложения.")
     for file_path in python_files:
@@ -305,7 +310,9 @@ def stage_inside_container(release: Path, remote_stage: str) -> None:
         ["docker", "cp", str(release / REQUIREMENTS_FILENAME), f"{DOCKER_CONTAINER}:{remote_stage}/{REQUIREMENTS_FILENAME}"],
         timeout=30,
     )
+    run_cmd(["docker", "cp", str(release / "tests"), f"{DOCKER_CONTAINER}:{remote_stage}/"], timeout=60)
     docker_exec("python", "-m", "compileall", "-q", f"{remote_stage}/app", timeout=60)
+    docker_exec("python", "-m", "compileall", "-q", f"{remote_stage}/tests", timeout=60)
 
 
 def current_site_packages() -> str:
@@ -406,6 +413,78 @@ print("AI CH staged import/startup check: OK")
             "Работающий контейнер не останавливался; подробности в логе updater."
         )
     LOG.info("Предварительная проверка импорта и startup пройдена: %s.", result.stdout.strip()[-500:])
+
+
+def smoke_test_regressions(remote_stage: str, dependency_sha: str | None) -> None:
+    """Run focused backend/frontend-contract regression tests before stopping the live app."""
+    dependency_path = f"/opt/ai-ch-deps/{dependency_sha}" if dependency_sha else ""
+    tests_dir = f"{remote_stage}/tests"
+    smoke_data_dir = f"{remote_stage}/.updater-regression-data"
+    smoke_upload_dir = f"{remote_stage}/.updater-regression-uploads"
+    smoke_sandbox_key_file = f"{remote_stage}/.updater-regression-sandbox-key"
+    docker_exec("mkdir", "-p", smoke_data_dir, smoke_upload_dir, timeout=15)
+    docker_exec("touch", smoke_sandbox_key_file, timeout=10)
+
+    script = f"""
+import sys
+import unittest
+
+sys.path.insert(0, {remote_stage!r})
+test_root = {tests_dir!r}
+patterns = (
+    "test_scheduled.py",
+    "test_auth_contract.py",
+    "test_chats_search.py",
+    "test_frontend_build.py",
+    "test_database_migrations.py",
+)
+loader = unittest.TestLoader()
+suite = unittest.TestSuite()
+for pattern in patterns:
+    suite.addTests(loader.discover(
+        start_dir=test_root,
+        pattern=pattern,
+        top_level_dir=test_root,
+    ))
+result = unittest.TextTestRunner(verbosity=2).run(suite)
+raise SystemExit(0 if result.wasSuccessful() else 1)
+"""
+    python_path = remote_stage + ((":" + dependency_path) if dependency_path else "")
+    LOG.info("Запускаю регрессионные тесты календаря, входа, поиска и cache fingerprint.")
+    result = run_cmd(
+        [
+            "docker", "exec",
+            "-w", remote_stage,
+            DOCKER_CONTAINER,
+            "env", "-i",
+            "PATH=/usr/local/bin:/usr/bin:/bin",
+            "PYTHONUNBUFFERED=1",
+            "PYTHONDONTWRITEBYTECODE=1",
+            f"PYTHONPATH={python_path}",
+            f"DATA_DIR={smoke_data_dir}",
+            f"UPLOAD_DIR={smoke_upload_dir}",
+            f"FRONTEND_DIR={remote_stage}/frontend",
+            f"SANDBOX_WORK_DIR={smoke_data_dir}/sandbox",
+            "SANDBOX_URL=",
+            "SANDBOX_API_KEY=",
+            f"SANDBOX_API_KEY_FILE={smoke_sandbox_key_file}",
+            "SESSION_SECRET=ai-ch-updater-regression-only-secret",
+            "SESSION_COOKIE_SECURE=0",
+            "ADMIN_EMAIL=updater-regression@example.invalid",
+            "ADMIN_PASSWORD=updater-regression-only-password",
+            "python", "-c", script,
+        ],
+        timeout=180,
+        check=False,
+    )
+    if result.returncode:
+        details = (result.stderr or result.stdout or f"exit code {result.returncode}").strip()
+        LOG.error("Регрессионные тесты новой версии не пройдены: %s", details[-7000:])
+        raise RuntimeError(
+            "Регрессионные тесты новой версии не пройдены. "
+            "Работающий контейнер не останавливался; подробности в логе updater."
+        )
+    LOG.info("Регрессионные тесты пройдены: %s.", result.stdout.strip()[-1200:])
 
 def replace_app_files(source_root: Path) -> None:
     # docker cp can write to a stopped container. Copy directory contents into
@@ -604,6 +683,7 @@ def perform_update(sha: str, state: dict[str, Any]) -> dict[str, Any]:
         # Import and run the app startup in a temporary cwd with a cleared environment.
         # Its default SQLite database is created under the staging directory, never /app/data.
         smoke_test_release(remote_stage, dependency_sha if dependency_changed else None)
+        smoke_test_regressions(remote_stage, dependency_sha if dependency_changed else None)
 
         # The existing process keeps serving until all validation and downloads are done.
         container_stop_if_running()
