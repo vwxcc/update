@@ -37,7 +37,7 @@ DOCKER_CONTAINER = os.getenv("DOCKER_CONTAINER", "ai-ch-mega").strip()
 APP_DIR = os.getenv("APP_DIR", "/app").rstrip("/")
 HEALTH_URL = os.getenv("HEALTH_URL", "http://127.0.0.1:3050/api/health").strip()
 CONTAINER_PORT = max(1, min(65535, int(os.getenv("CONTAINER_PORT", "8000"))))
-UPDATER_VERSION = 3
+UPDATER_VERSION = 4
 HEALTH_TIMEOUT = max(15, int(os.getenv("HEALTH_TIMEOUT", "90")))
 HTTP_TIMEOUT = max(5, int(os.getenv("HTTP_TIMEOUT", "25")))
 KEEP_RELEASES = max(2, min(10, int(os.getenv("KEEP_RELEASES", "3"))))
@@ -344,8 +344,19 @@ def prepare_dependency_set(remote_stage: str, sha: str, release: Path, requireme
 
 
 def smoke_test_release(remote_stage: str, dependency_sha: str | None) -> None:
-    """Import the staged app and execute FastAPI lifespan without touching live data."""
+    """Import the staged app and run its lifespan with isolated temporary storage."""
     dependency_path = f"/opt/ai-ch-deps/{dependency_sha}" if dependency_sha else ""
+    smoke_data_dir = f"{remote_stage}/.updater-smoke-data"
+    smoke_upload_dir = f"{remote_stage}/.updater-smoke-uploads"
+    smoke_frontend_dir = f"{remote_stage}/frontend"
+    smoke_sandbox_key_file = f"{remote_stage}/.updater-smoke-sandbox-key"
+
+    # Settings otherwise default to /app/data and /app/uploads even under a
+    # staging cwd. Explicit overrides keep the preflight away from live DB,
+    # uploaded files and the production sandbox secret.
+    docker_exec("mkdir", "-p", smoke_data_dir, smoke_upload_dir, timeout=15)
+    docker_exec("touch", smoke_sandbox_key_file, timeout=10)
+
     script = f"""
 import asyncio
 import sys
@@ -371,6 +382,17 @@ print("AI CH staged import/startup check: OK")
             "PATH=/usr/local/bin:/usr/bin:/bin",
             "PYTHONUNBUFFERED=1",
             "PYTHONDONTWRITEBYTECODE=1",
+            f"DATA_DIR={smoke_data_dir}",
+            f"UPLOAD_DIR={smoke_upload_dir}",
+            f"FRONTEND_DIR={smoke_frontend_dir}",
+            f"SANDBOX_WORK_DIR={smoke_data_dir}/sandbox",
+            "SANDBOX_URL=",
+            "SANDBOX_API_KEY=",
+            f"SANDBOX_API_KEY_FILE={smoke_sandbox_key_file}",
+            "SESSION_SECRET=ai-ch-updater-smoke-only-secret",
+            "SESSION_COOKIE_SECURE=0",
+            "ADMIN_EMAIL=updater-smoke@example.invalid",
+            "ADMIN_PASSWORD=updater-smoke-only-password",
             "python", "-c", script,
         ],
         timeout=120,
