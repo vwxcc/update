@@ -58,6 +58,84 @@ class CurrentReleaseLayoutTests(unittest.TestCase):
             updater.validate_release(root)
 
 
+    def test_incomplete_cached_release_is_redownloaded_and_replaced_atomically(self):
+        sha = "a" * 40
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            releases = root / "releases"
+            cached = releases / sha
+            cached.mkdir(parents=True)
+            (cached / "partial.txt").write_text("stale partial extraction", encoding="utf-8")
+
+            def fake_download(_sha, archive):
+                archive.parent.mkdir(parents=True, exist_ok=True)
+                archive.write_bytes(b"archive-placeholder")
+
+            def fake_extract(_archive, destination):
+                self.make_release(destination)
+                updater.validate_release(destination)
+
+            with (
+                patch.object(updater, "UPDATE_ROOT", root),
+                patch.object(updater, "download_archive", side_effect=fake_download) as download,
+                patch.object(updater, "extract_release", side_effect=fake_extract) as extract,
+            ):
+                result = updater.prepare_release(sha, releases)
+
+            self.assertEqual(result, cached)
+            self.assertTrue((cached / "app" / "main.py").is_file())
+            self.assertTrue((cached / "sandbox" / "server.py").is_file())
+            self.assertFalse((cached / "partial.txt").exists())
+            download.assert_called_once()
+            extract.assert_called_once()
+            self.assertFalse((root / f".source-{sha}.tar.gz").exists())
+            self.assertFalse(any("staging" in item.name for item in releases.iterdir()))
+
+    def test_valid_cached_release_is_reused_without_download(self):
+        sha = "b" * 40
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            releases = root / "releases"
+            cached = releases / sha
+            self.make_release(cached)
+            with (
+                patch.object(updater, "UPDATE_ROOT", root),
+                patch.object(updater, "download_archive") as download,
+                patch.object(updater, "extract_release") as extract,
+            ):
+                result = updater.prepare_release(sha, releases)
+            self.assertEqual(result, cached)
+            download.assert_not_called()
+            extract.assert_not_called()
+
+    def test_failed_fresh_extraction_does_not_leave_poisoned_release_cache(self):
+        sha = "c" * 40
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            releases = root / "releases"
+
+            def fake_download(_sha, archive):
+                archive.parent.mkdir(parents=True, exist_ok=True)
+                archive.write_bytes(b"archive-placeholder")
+
+            def fake_extract(_archive, destination):
+                destination.mkdir(parents=True)
+                (destination / "partial.txt").write_text("partial", encoding="utf-8")
+                raise RuntimeError("simulated extraction failure")
+
+            with (
+                patch.object(updater, "UPDATE_ROOT", root),
+                patch.object(updater, "download_archive", side_effect=fake_download),
+                patch.object(updater, "extract_release", side_effect=fake_extract),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "simulated extraction failure"):
+                    updater.prepare_release(sha, releases)
+
+            self.assertFalse((releases / sha).exists())
+            self.assertFalse(any("staging" in item.name for item in releases.iterdir()))
+            self.assertFalse((root / f".source-{sha}.tar.gz").exists())
+
+
     def test_release_rejects_missing_sandbox_runner(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
