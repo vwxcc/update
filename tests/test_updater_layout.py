@@ -20,6 +20,25 @@ class CurrentReleaseLayoutTests(unittest.TestCase):
         (root / "app" / "main.py").write_text("app = object()\n", encoding="utf-8")
         (root / "frontend" / "index.html").write_text("<!doctype html>\n", encoding="utf-8")
         (root / "requirements.txt").write_text("fastapi==0.115.6\n", encoding="utf-8")
+        sandbox = root / "sandbox"
+        (sandbox / "designs").mkdir(parents=True)
+        (sandbox / "fonts").mkdir()
+        (sandbox / "Dockerfile").write_text("FROM python:3.12-slim\n", encoding="utf-8")
+        (sandbox / "server.py").write_text(
+            "import os\n"
+            "def _sandbox_api_key():\n"
+            "    return os.environ.get(\"SANDBOX_API_KEY_FILE\", \"\")\n"
+            "class Handler:\n"
+            "    def do_GET(self):\n"
+            "        path = \"/ready\"\n"
+            "        if path == \"/ready\":\n"
+            "            if not self._authorized():\n"
+            "                self._json(401, {})\n",
+            encoding="utf-8",
+        )
+        (sandbox / "requirements.txt").write_text("httpx==0.28.1\n", encoding="utf-8")
+        (sandbox / "designs" / "__init__.py").write_text("", encoding="utf-8")
+        (sandbox / "fonts" / "placeholder.txt").write_text("font asset\n", encoding="utf-8")
         for name in (
             "test_scheduled.py",
             "test_auth_contract.py",
@@ -27,14 +46,34 @@ class CurrentReleaseLayoutTests(unittest.TestCase):
             "test_frontend_build.py",
             "test_database_migrations.py",
             "test_sandbox_runtime.py",
+            "test_tool_commands.py",
+            "test_completion_ui.py",
         ):
             (tests / name).write_text("import unittest\n", encoding="utf-8")
 
-    def test_release_without_sandbox_is_valid(self):
+    def test_release_with_runner_image_sources_is_valid(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self.make_release(root)
             updater.validate_release(root)
+
+
+    def test_release_rejects_missing_sandbox_runner(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.make_release(root)
+            (root / "sandbox" / "server.py").unlink()
+            with self.assertRaisesRegex(RuntimeError, "sandbox/server.py"):
+                updater.validate_release(root)
+
+    def test_sandbox_source_fingerprint_tracks_runner_and_asset_changes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.make_release(root)
+            first = updater.sandbox_source_fingerprint(root)
+            (root / "sandbox" / "designs" / "__init__.py").write_text("changed = True\n", encoding="utf-8")
+            second = updater.sandbox_source_fingerprint(root)
+            self.assertNotEqual(first, second)
 
     def test_release_requires_current_app_entrypoints(self):
         with tempfile.TemporaryDirectory() as temp:

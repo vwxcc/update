@@ -37,7 +37,7 @@ DOCKER_CONTAINER = os.getenv("DOCKER_CONTAINER", "ai-ch-mega").strip()
 APP_DIR = os.getenv("APP_DIR", "/app").rstrip("/")
 HEALTH_URL = os.getenv("HEALTH_URL", "http://127.0.0.1:3050/api/health").strip()
 CONTAINER_PORT = max(1, min(65535, int(os.getenv("CONTAINER_PORT", "8000"))))
-UPDATER_VERSION = 6
+UPDATER_VERSION = 7
 HEALTH_TIMEOUT = max(15, int(os.getenv("HEALTH_TIMEOUT", "90")))
 HTTP_TIMEOUT = max(5, int(os.getenv("HTTP_TIMEOUT", "25")))
 KEEP_RELEASES = max(2, min(10, int(os.getenv("KEEP_RELEASES", "3"))))
@@ -218,7 +218,7 @@ def download_archive(sha: str, destination: Path) -> None:
 
 def extract_release(archive: Path, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
-    allowed_top = {"app", "frontend", "tests", REQUIREMENTS_FILENAME}
+    allowed_top = {"app", "frontend", "tests", "sandbox", REQUIREMENTS_FILENAME}
     allowed_files = 0
     with tarfile.open(archive, mode="r:gz") as tar:
         members = tar.getmembers()
@@ -264,11 +264,36 @@ def validate_release(path: Path) -> None:
         path / "tests" / "test_frontend_build.py",
         path / "tests" / "test_database_migrations.py",
         path / "tests" / "test_sandbox_runtime.py",
+        path / "tests" / "test_tool_commands.py",
+        path / "tests" / "test_completion_ui.py",
+        path / "sandbox" / "Dockerfile",
+        path / "sandbox" / "server.py",
+        path / "sandbox" / "requirements.txt",
     ]
     missing = [str(item.relative_to(path)) for item in required if not item.is_file()]
     if missing:
         raise RuntimeError("Релиз неполный; отсутствуют: " + ", ".join(missing))
-    python_files = list((path / "app").rglob("*.py")) + list((path / "tests").rglob("*.py"))
+    for directory in (path / "sandbox" / "designs", path / "sandbox" / "fonts"):
+        if not directory.is_dir():
+            raise RuntimeError("Релиз песочницы неполный; отсутствует каталог: " + str(directory.relative_to(path)))
+    runner_source = (path / "sandbox" / "server.py").read_text(encoding="utf-8")
+    runner_contract = (
+        "def _sandbox_api_key()",
+        "SANDBOX_API_KEY_FILE",
+        'if path == "/ready":',
+        "if not self._authorized():",
+    )
+    missing_runner_contract = [token for token in runner_contract if token not in runner_source]
+    if missing_runner_contract:
+        raise RuntimeError(
+            "sandbox/server.py несовместим с updater v7: требуется чтение SANDBOX_API_KEY_FILE "
+            "и аутентифицированный /ready. Сначала слейте PR #298; runner не запускался."
+        )
+    python_files = (
+        list((path / "app").rglob("*.py"))
+        + list((path / "tests").rglob("*.py"))
+        + list((path / "sandbox").rglob("*.py"))
+    )
     if not python_files:
         raise RuntimeError("В релизе нет Python-файлов приложения.")
     for file_path in python_files:
@@ -439,6 +464,8 @@ patterns = (
     "test_frontend_build.py",
     "test_database_migrations.py",
     "test_sandbox_runtime.py",
+    "test_tool_commands.py",
+    "test_completion_ui.py",
 )
 loader = unittest.TestLoader()
 suite = unittest.TestSuite()
@@ -636,6 +663,284 @@ def prune_removed_files(previous_root: Path, release_root: Path) -> None:
     except Exception as exc:
         LOG.warning("Очистка устаревших исходных файлов пропущена: %s", exc)
 
+
+
+SANDBOX_CONTAINER = "ai-ch-sandbox"
+SANDBOX_NETWORK = "ai-ch-sandbox-internal"
+SANDBOX_IMAGE_REPOSITORY = "ai-ch-sandbox"
+SANDBOX_BASE_IMAGE = "python:3.12-slim"
+
+
+def sandbox_source_fingerprint(release: Path) -> str:
+    root = (release / "sandbox").resolve()
+    required = [root / "Dockerfile", root / "server.py", root / "requirements.txt"]
+    if any(not item.is_file() for item in required):
+        raise RuntimeError("В релизе отсутствуют Dockerfile/server.py/requirements.txt песочницы.")
+    files = list(required)
+    for name in ("designs", "fonts"):
+        directory = root / name
+        if not directory.is_dir():
+            raise RuntimeError("В релизе песочницы отсутствует каталог " + name + ".")
+        for item in directory.rglob("*"):
+            if item.is_symlink():
+                raise RuntimeError("В исходниках песочницы обнаружена символическая ссылка.")
+            if item.is_file():
+                files.append(item)
+    digest = hashlib.sha256()
+    for item in sorted(files, key=lambda value: value.relative_to(root).as_posix()):
+        if item.is_symlink():
+            raise RuntimeError("В исходниках песочницы обнаружена символическая ссылка.")
+        digest.update(item.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(b"\0" + bytes.fromhex(sha256_file(item)))
+    return digest.hexdigest()
+
+
+def sandbox_container_running(name: str = SANDBOX_CONTAINER) -> bool:
+    result = run_cmd(["docker", "inspect", "--format={{.State.Running}}", name], timeout=15, check=False)
+    return result.returncode == 0 and result.stdout.strip().lower() == "true"
+
+
+def sandbox_probe_script(url: str, secret_path: str) -> str:
+    return (
+        "from pathlib import Path; import urllib.request; "
+        f"key=Path({secret_path!r}).read_text(encoding='utf-8').strip(); "
+        f"req=urllib.request.Request({url!r},headers={{'Authorization':'Bearer '+key}}); "
+        "response=urllib.request.urlopen(req,timeout=4); assert response.status==200"
+    )
+
+
+def wait_for_sandbox_probe(container: str, url: str, secret_path: str, attempts: int = 35) -> None:
+    script = sandbox_probe_script(url, secret_path)
+    last_error = ""
+    for _ in range(max(1, attempts)):
+        result = run_cmd(["docker", "exec", container, "python", "-c", script], timeout=8, check=False)
+        if result.returncode == 0:
+            return
+        last_error = (result.stderr or result.stdout or "").strip()[-240:]
+        time.sleep(1)
+    raise RuntimeError("Sandbox runner не прошёл аутентифицированную проверку /ready. " + (last_error or "Нет ответа."))
+
+
+def sandbox_current_ready() -> bool:
+    if not sandbox_container_running():
+        return False
+    try:
+        script = sandbox_probe_script(
+            "http://ai-ch-sandbox:8000/ready",
+            f"{APP_DIR}/data/.sandbox_api_key",
+        )
+        result = run_cmd(["docker", "exec", DOCKER_CONTAINER, "python", "-c", script], timeout=8, check=False)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def sandbox_app_data_source() -> Path:
+    target = f"{APP_DIR}/data"
+    template = "{{range .Mounts}}{{if eq .Destination " + json.dumps(target) + "}}{{.Source}}{{end}}{{end}}"
+    result = run_cmd(["docker", "inspect", "--format", template, DOCKER_CONTAINER], timeout=15, check=False)
+    raw = result.stdout.strip()
+    if result.returncode or not raw or not raw.startswith("/") or "," in raw:
+        raise RuntimeError("Не удалось безопасно определить постоянный Docker mount каталога данных AI CH.")
+    data_dir = Path(raw).resolve()
+    if not data_dir.is_absolute() or data_dir == Path("/"):
+        raise RuntimeError("Docker mount каталога данных имеет недопустимый путь.")
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
+
+
+def ensure_sandbox_secret(data_dir: Path) -> Path:
+    script = (
+        "import os,secrets; from pathlib import Path; from app.config import settings; "
+        "path=Path('/app/data/.sandbox_api_key'); path.parent.mkdir(parents=True,exist_ok=True); "
+        "(_ for _ in ()).throw(RuntimeError('sandbox secret path is a symlink')) if path.is_symlink() else None; "
+        "key=str(settings.sandbox_api_key or '').strip() or secrets.token_urlsafe(48); "
+        "(_ for _ in ()).throw(RuntimeError('sandbox key too short')) if len(key)<32 else None; "
+        "tmp=path.with_name(path.name+'.updater-tmp'); tmp.unlink(missing_ok=True); "
+        "tmp.write_text(key+'\\n',encoding='utf-8'); os.chmod(tmp,0o600); "
+        "os.replace(tmp,path); os.chmod(path,0o600); print('sandbox runner secret prepared')"
+    )
+    docker_exec("python", "-c", script, timeout=30)
+    secret = data_dir / ".sandbox_api_key"
+    if secret.is_symlink() or not secret.is_file() or len(secret.read_text(encoding="utf-8").strip()) < 32:
+        raise RuntimeError("Не удалось безопасно подготовить файл секрета sandbox runner.")
+    os.chmod(secret,0o600)
+    return secret
+
+
+def ensure_sandbox_network() -> None:
+    result = run_cmd(
+        ["docker", "network", "inspect", "--format={{.Internal}}", SANDBOX_NETWORK],
+        timeout=15, check=False,
+    )
+    if result.returncode:
+        run_cmd(["docker", "network", "create", "--internal", SANDBOX_NETWORK], timeout=30)
+    elif result.stdout.strip().lower() != "true":
+        raise RuntimeError(
+            f"Docker-сеть {SANDBOX_NETWORK} существует, но не является internal; "
+            "автоматически менять сетевые свойства небезопасно."
+        )
+    inspected = run_cmd(
+        ["docker", "inspect", "--format={{json .NetworkSettings.Networks}}", DOCKER_CONTAINER],
+        timeout=15,
+    )
+    try:
+        networks = json.loads(inspected.stdout.strip() or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Не удалось прочитать Docker-сети основного контейнера.") from exc
+    if SANDBOX_NETWORK not in networks:
+        run_cmd(["docker", "network", "connect", SANDBOX_NETWORK, DOCKER_CONTAINER], timeout=30)
+
+
+def build_sandbox_image(release: Path, fingerprint: str) -> str:
+    image = f"{SANDBOX_IMAGE_REPOSITORY}:{fingerprint[:16]}"
+    if run_cmd(["docker", "image", "inspect", image], timeout=15, check=False).returncode == 0:
+        return image
+    if run_cmd(["docker", "image", "inspect", SANDBOX_BASE_IMAGE], timeout=15, check=False).returncode:
+        run_cmd(["docker", "pull", SANDBOX_BASE_IMAGE], timeout=600)
+
+    builder = f"ai-ch-sandbox-build-{fingerprint[:12]}"
+    run_cmd(["docker", "rm", "-f", builder], timeout=30, check=False)
+    run_cmd(
+        ["docker", "create", "--name", builder, "--network", "bridge",
+         "--entrypoint", "sh", SANDBOX_BASE_IMAGE, "-c",
+         "mkdir -p /srv /run/secrets /work/projects && exec sleep infinity"],
+        timeout=30,
+    )
+    try:
+        run_cmd(["docker", "start", builder], timeout=30)
+        run_cmd(["docker", "exec", builder, "mkdir", "-p", "/srv/designs", "/srv/fonts"], timeout=15)
+        sandbox = release / "sandbox"
+        run_cmd(["docker", "cp", str(sandbox / "requirements.txt"), f"{builder}:/srv/requirements.txt"], timeout=30)
+        run_cmd(["docker", "cp", str(sandbox / "server.py"), f"{builder}:/srv/server.py"], timeout=30)
+        run_cmd(["docker", "cp", str(sandbox / "designs") + "/.", f"{builder}:/srv/designs/"], timeout=90)
+        run_cmd(["docker", "cp", str(sandbox / "fonts") + "/.", f"{builder}:/srv/fonts/"], timeout=90)
+        run_cmd(
+            ["docker", "exec", builder, "python", "-m", "pip", "install",
+             "--disable-pip-version-check", "--no-cache-dir", "-r", "/srv/requirements.txt"],
+            timeout=900,
+        )
+        run_cmd(
+            ["docker", "commit", "--change", "WORKDIR /srv",
+             "--change", "ENTRYPOINT []",
+             "--change", 'CMD ["python", "/srv/server.py"]',
+             "--change", "EXPOSE 8000",
+             "--change", "ENV PYTHONUNBUFFERED=1",
+             "--change", "ENV PYTHONDONTWRITEBYTECODE=1",
+             builder, image],
+            timeout=180,
+        )
+    finally:
+        run_cmd(["docker", "rm", "-f", builder], timeout=30, check=False)
+    return image
+
+
+def ensure_sandbox_runner(release: Path, sha: str, fingerprint: str) -> tuple[str | None, bool]:
+    data_dir = sandbox_app_data_source()
+    work_dir = data_dir / "sandbox"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / "projects").mkdir(parents=True, exist_ok=True)
+    if "," in str(work_dir) or "," in str(data_dir / ".sandbox_api_key"):
+        raise RuntimeError("Путь данных sandbox содержит недопустимую запятую для Docker mount.")
+    os.chmod(work_dir,0o711)
+    os.chmod(work_dir / "projects",0o711)
+    secret = ensure_sandbox_secret(data_dir)
+    ensure_sandbox_network()
+
+    image = build_sandbox_image(release, fingerprint)
+    if sandbox_container_running():
+        current_image = run_cmd(
+            ["docker", "inspect", "--format={{.Config.Image}}", SANDBOX_CONTAINER], timeout=15
+        ).stdout.strip()
+        if current_image == image:
+            try:
+                wait_for_sandbox_probe(
+                    DOCKER_CONTAINER, "http://ai-ch-sandbox:8000/ready",
+                    f"{APP_DIR}/data/.sandbox_api_key", attempts=2,
+                )
+                return None, False
+            except Exception:
+                pass
+
+    candidate = f"{SANDBOX_CONTAINER}-candidate-{fingerprint[:8]}"
+    run_cmd(["docker", "rm", "-f", candidate], timeout=30, check=False)
+    run_cmd(
+        ["docker", "create", "--name", candidate, "--restart", "unless-stopped",
+         "--network", SANDBOX_NETWORK, "--read-only",
+         "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=128m",
+         "--cap-drop", "ALL", "--cap-add", "CHOWN", "--cap-add", "SETUID", "--cap-add", "SETGID",
+         # Supervisor-only permissions: collect child-owned 0700/0600 files and
+         # reset project permissions before the next run. Popen drops them on setuid.
+         "--cap-add", "DAC_OVERRIDE", "--cap-add", "FOWNER",
+         "--memory", "1g", "--cpus", "1.5", "--pids-limit", "256",
+         "--security-opt", "no-new-privileges",
+         "--mount", f"type=bind,src={work_dir},dst=/work",
+         "--mount", f"type=bind,src={secret},dst=/run/secrets/sandbox_api_key,readonly",
+         "--env", "SANDBOX_WORK=/work", "--env", "SANDBOX_REQUIRE_AUTH=1",
+         "--env", "SANDBOX_CONCURRENCY=1",
+         "--env", "SANDBOX_API_KEY_FILE=/run/secrets/sandbox_api_key", image],
+        timeout=60,
+    )
+    run_cmd(["docker", "start", candidate], timeout=45)
+    try:
+        wait_for_sandbox_probe(candidate, "http://127.0.0.1:8000/ready", "/run/secrets/sandbox_api_key")
+    except Exception:
+        run_cmd(["docker", "rm", "-f", candidate], timeout=30, check=False)
+        raise
+
+    previous: str | None = None
+    existing = run_cmd(["docker", "inspect", SANDBOX_CONTAINER], timeout=15, check=False)
+    if existing.returncode == 0:
+        previous = f"{SANDBOX_CONTAINER}-previous-{sha[:8]}"
+        if run_cmd(["docker", "inspect", previous], timeout=15, check=False).returncode == 0:
+            previous += "-" + str(int(time.time()))
+        run_cmd(["docker", "stop", "--time", "20", SANDBOX_CONTAINER], timeout=40, check=False)
+        run_cmd(["docker", "rename", SANDBOX_CONTAINER, previous], timeout=30)
+    try:
+        run_cmd(["docker", "rename", candidate, SANDBOX_CONTAINER], timeout=30)
+        wait_for_sandbox_probe(
+            DOCKER_CONTAINER, "http://ai-ch-sandbox:8000/ready",
+            f"{APP_DIR}/data/.sandbox_api_key",
+        )
+    except Exception:
+        run_cmd(["docker", "rm", "-f", SANDBOX_CONTAINER], timeout=30, check=False)
+        if previous:
+            run_cmd(["docker", "rename", previous, SANDBOX_CONTAINER], timeout=30, check=False)
+            run_cmd(["docker", "start", SANDBOX_CONTAINER], timeout=40, check=False)
+        run_cmd(["docker", "rm", "-f", candidate], timeout=30, check=False)
+        raise
+    return previous, True
+
+
+def restore_sandbox_runner(previous: str | None, changed: bool) -> bool:
+    if not changed:
+        return True
+    try:
+        run_cmd(["docker", "rm", "-f", SANDBOX_CONTAINER], timeout=30, check=False)
+        if previous:
+            run_cmd(["docker", "rename", previous, SANDBOX_CONTAINER], timeout=30)
+            run_cmd(["docker", "start", SANDBOX_CONTAINER], timeout=40)
+            wait_for_sandbox_probe(
+                DOCKER_CONTAINER, "http://ai-ch-sandbox:8000/ready",
+                f"{APP_DIR}/data/.sandbox_api_key", attempts=15,
+            )
+        return True
+    except Exception:
+        LOG.exception("Не удалось восстановить предыдущий sandbox runner.")
+        return False
+
+
+def finalize_sandbox_runner(previous: str | None) -> None:
+    if not previous:
+        return
+    result = run_cmd(["docker", "rm", "-f", previous], timeout=40, check=False)
+    if result.returncode:
+        LOG.warning("Старый runner %s оставлен для ручной проверки.", previous)
+    else:
+        LOG.info("Предыдущий sandbox runner удалён после успешного health-check.")
+
+
+
 def perform_update(sha: str, state: dict[str, Any]) -> dict[str, Any]:
     if TARGET_MODE != "docker":
         raise RuntimeError("Поддерживается TARGET_MODE=docker. Другой режим не реализован в этой версии.")
@@ -666,6 +971,9 @@ def perform_update(sha: str, state: dict[str, Any]) -> dict[str, Any]:
     dependency_sha = state.get("dependency_sha")
     dependency_changed = False
     app_was_stopped = False
+    previous_runner_container: str | None = None
+    sandbox_runner_changed = False
+    runner_fingerprint = sandbox_source_fingerprint(release)
     try:
         backup.parent.mkdir(parents=True, exist_ok=True)
         if backup.exists():
@@ -686,6 +994,8 @@ def perform_update(sha: str, state: dict[str, Any]) -> dict[str, Any]:
         # Its default SQLite database is created under the staging directory, never /app/data.
         smoke_test_release(remote_stage, dependency_sha if dependency_changed else None)
         smoke_test_regressions(remote_stage, dependency_sha if dependency_changed else None)
+        LOG.info("Проверки приложения пройдены; проверяю и при необходимости обновляю отдельный sandbox runner.")
+        previous_runner_container, sandbox_runner_changed = ensure_sandbox_runner(release, sha, runner_fingerprint)
 
         # The existing process keeps serving until all validation and downloads are done.
         container_stop_if_running()
@@ -702,15 +1012,24 @@ def perform_update(sha: str, state: dict[str, Any]) -> dict[str, Any]:
             # cp still works against a stopped container; the pointer is restored
             # before starting the old code again.
             restored = rollback(backup, state, site_packages, work_dir, release)
+            app_was_stopped = False
+            runner_restored = restore_sandbox_runner(previous_runner_container, sandbox_runner_changed)
+            sandbox_runner_changed = False
             state["failed_sha"] = sha
             state["failed_updater_version"] = UPDATER_VERSION
             state["last_error"] = "внутренняя health-проверка новой версии не пройдена"
             state["last_check"] = utc_now()
-            if not restored:
+            if not restored or not runner_restored:
                 state["rollback_failed"] = True
             write_state(state)
-            raise RuntimeError("Обновление отменено; предыдущая версия восстановлена." if restored else
-                               "Обновление не прошло проверку, и автоматический откат не подтвердился.")
+            raise RuntimeError(
+                "Обновление отменено; предыдущая версия приложения и runner восстановлены."
+                if restored and runner_restored else
+                "Обновление не прошло проверку; автоматический откат приложения или runner не подтвердился."
+            )
+        finalize_sandbox_runner(previous_runner_container)
+        sandbox_runner_changed = False
+        state["sandbox_image_sha"] = runner_fingerprint
         prune_removed_files(backup, release)
         state["applied_sha"] = sha
         state["dependency_sha"] = dependency_sha
@@ -738,8 +1057,12 @@ def perform_update(sha: str, state: dict[str, Any]) -> dict[str, Any]:
             LOG.exception("Ошибка во время переключения версии.")
             try:
                 rollback(backup, state, site_packages, work_dir, release)
+                app_was_stopped = False
             except Exception:
                 LOG.exception("Не удалось выполнить резервный откат.")
+        if sandbox_runner_changed:
+            restore_sandbox_runner(previous_runner_container, sandbox_runner_changed)
+            sandbox_runner_changed = False
         raise
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -813,10 +1136,10 @@ def main() -> int:
             state["remote_sha"] = latest
             state["etag"] = etag
             state["last_check"] = utc_now()
-            if state.get("applied_sha") == latest:
+            if state.get("applied_sha") == latest and state.get("sandbox_image_sha") and sandbox_current_ready():
                 state["last_error"] = None
                 write_state(state)
-                LOG.info("Изменений нет; приложение уже на версии %s.", latest[:12])
+                LOG.info("Изменений нет; приложение и sandbox runner уже готовы на версии %s.", latest[:12])
                 prune_releases(latest, latest)
                 return 0
             if failed_commit_for_current_updater(state, latest):
