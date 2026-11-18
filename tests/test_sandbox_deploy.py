@@ -77,7 +77,7 @@ class SandboxProvisioningTests(unittest.TestCase):
                 )
             if args[1] == "logs":
                 return subprocess.CompletedProcess(
-                    args, 0, "Traceback (most recent call last):\\nRuntimeError: startup failed", ""
+                    args, 0, "Traceback (most recent call last):\nRuntimeError: startup failed", ""
                 )
             raise AssertionError(f"Unexpected command: {args}")
 

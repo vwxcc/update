@@ -820,7 +820,7 @@ def ensure_sandbox_secret(data_dir: Path) -> Path:
         "key=str(settings.sandbox_api_key or '').strip() or secrets.token_urlsafe(48); "
         "(_ for _ in ()).throw(RuntimeError('sandbox key too short')) if len(key)<32 else None; "
         "tmp=path.with_name(path.name+'.updater-tmp'); tmp.unlink(missing_ok=True); "
-        "tmp.write_text(key+'\\n',encoding='utf-8'); os.chmod(tmp,0o600); "
+        "tmp.write_text(key+'\n',encoding='utf-8'); os.chmod(tmp,0o600); "
         "os.replace(tmp,path); os.chmod(path,0o600); print('sandbox runner secret prepared')"
     )
     docker_exec("python", "-c", script, timeout=30)
@@ -920,13 +920,13 @@ def sandbox_container_diagnostics(container: str) -> str:
             timeout=15,
             check=False,
         )
-        logs = "\\n".join(part for part in (result.stdout, result.stderr) if part).strip()
+        logs = "\n".join(part for part in (result.stdout, result.stderr) if part).strip()
         if not logs and result.returncode:
             logs = (result.stderr or result.stdout or "docker logs не вернул подробностей").strip()
-        sections.append("Последние 80 строк docker logs:\\n" + (logs[-6000:] if logs else "лог пуст"))
+        sections.append("Последние 80 строк docker logs:\n" + (logs[-6000:] if logs else "лог пуст"))
     except Exception as exc:
         sections.append("Docker logs не удалось получить: " + type(exc).__name__)
-    return "\\n".join(sections)
+    return "\n".join(sections)
 
 
 def ensure_sandbox_runner(release: Path, sha: str, fingerprint: str) -> tuple[str | None, bool]:
@@ -981,7 +981,7 @@ def ensure_sandbox_runner(release: Path, sha: str, fingerprint: str) -> tuple[st
     except Exception as exc:
         diagnostics = sandbox_container_diagnostics(candidate)
         run_cmd(["docker", "rm", "-f", candidate], timeout=30, check=False)
-        raise RuntimeError(f"{exc}\\n{diagnostics}") from exc
+        raise RuntimeError(f"{exc}\n{diagnostics}") from exc
 
     previous: str | None = None
     existing = run_cmd(["docker", "inspect", SANDBOX_CONTAINER], timeout=15, check=False)
@@ -1170,7 +1170,7 @@ def cleanup_dependency_dirs(history: list[str], current_sha: str | None) -> None
     try:
         if not docker_running():
             return
-        result = docker_exec("sh", "-c", "find /opt/ai-ch-deps -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null || true",
+        result = docker_exec("sh", "-c", "find /opt/ai-ch-deps -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null || true",
                              timeout=15, check=False)
         for name in result.stdout.splitlines():
             if SHA_RE.fullmatch(name) and name not in keep:
