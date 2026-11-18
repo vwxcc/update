@@ -59,6 +59,9 @@ class SandboxProvisioningTests(unittest.TestCase):
         self.assertIn('"--cap-add", "CHOWN"', source)
         self.assertIn('"--cap-add", "SETUID"', source)
         self.assertIn('"--cap-add", "SETGID"', source)
+        # The privileged runner supervisor needs these to collect/reset child-owned files.
+        self.assertIn('"--cap-add", "DAC_OVERRIDE"', source)
+        self.assertIn('"--cap-add", "FOWNER"', source)
         self.assertIn('"--read-only"', source)
         self.assertIn('"--pids-limit", "256"', source)
         self.assertIn('dst=/run/secrets/sandbox_api_key,readonly', source)
