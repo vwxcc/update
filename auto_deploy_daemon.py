@@ -37,7 +37,7 @@ DOCKER_CONTAINER = os.getenv("DOCKER_CONTAINER", "ai-ch-mega").strip()
 APP_DIR = os.getenv("APP_DIR", "/app").rstrip("/")
 HEALTH_URL = os.getenv("HEALTH_URL", "http://127.0.0.1:3050/api/health").strip()
 CONTAINER_PORT = max(1, min(65535, int(os.getenv("CONTAINER_PORT", "8000"))))
-UPDATER_VERSION = 9
+UPDATER_VERSION = 10
 HEALTH_TIMEOUT = max(15, int(os.getenv("HEALTH_TIMEOUT", "90")))
 HTTP_TIMEOUT = max(5, int(os.getenv("HTTP_TIMEOUT", "25")))
 KEEP_RELEASES = max(2, min(10, int(os.getenv("KEEP_RELEASES", "3"))))
@@ -812,17 +812,22 @@ def sandbox_app_data_source() -> Path:
     return data_dir
 
 
-def ensure_sandbox_secret(data_dir: Path) -> Path:
-    script = (
+def sandbox_secret_script() -> str:
+    """Build a valid one-line Python command without nested newline escaping."""
+    return (
         "import os,secrets; from pathlib import Path; from app.config import settings; "
         "path=Path('/app/data/.sandbox_api_key'); path.parent.mkdir(parents=True,exist_ok=True); "
         "(_ for _ in ()).throw(RuntimeError('sandbox secret path is a symlink')) if path.is_symlink() else None; "
         "key=str(settings.sandbox_api_key or '').strip() or secrets.token_urlsafe(48); "
         "(_ for _ in ()).throw(RuntimeError('sandbox key too short')) if len(key)<32 else None; "
         "tmp=path.with_name(path.name+'.updater-tmp'); tmp.unlink(missing_ok=True); "
-        "tmp.write_text(key+'\n',encoding='utf-8'); os.chmod(tmp,0o600); "
+        "tmp.write_text(key+chr(10),encoding='utf-8'); os.chmod(tmp,0o600); "
         "os.replace(tmp,path); os.chmod(path,0o600); print('sandbox runner secret prepared')"
     )
+
+
+def ensure_sandbox_secret(data_dir: Path) -> Path:
+    script = sandbox_secret_script()
     docker_exec("python", "-c", script, timeout=30)
     secret = data_dir / ".sandbox_api_key"
     if secret.is_symlink() or not secret.is_file() or len(secret.read_text(encoding="utf-8").strip()) < 32:

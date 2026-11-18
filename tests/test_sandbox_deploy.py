@@ -32,6 +32,11 @@ class SandboxProvisioningTests(unittest.TestCase):
             command = run_cmd.call_args.args[0]
             self.assertIn('eq .Destination "/app/data"', command[3])
 
+    def test_sandbox_secret_script_is_valid_python_and_appends_newline(self):
+        script = updater.sandbox_secret_script()
+        compile(script, "<sandbox-secret-script>", "exec")
+        self.assertIn("tmp.write_text(key+chr(10),encoding='utf-8')", script)
+
     def test_internal_network_is_created_and_connected_to_app(self):
         def fake_run(args, **kwargs):
             if args[:3] == ["docker", "network", "inspect"]:
