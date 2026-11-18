@@ -37,7 +37,7 @@ DOCKER_CONTAINER = os.getenv("DOCKER_CONTAINER", "ai-ch-mega").strip()
 APP_DIR = os.getenv("APP_DIR", "/app").rstrip("/")
 HEALTH_URL = os.getenv("HEALTH_URL", "http://127.0.0.1:3050/api/health").strip()
 CONTAINER_PORT = max(1, min(65535, int(os.getenv("CONTAINER_PORT", "8000"))))
-UPDATER_VERSION = 8
+UPDATER_VERSION = 9
 HEALTH_TIMEOUT = max(15, int(os.getenv("HEALTH_TIMEOUT", "90")))
 HTTP_TIMEOUT = max(5, int(os.getenv("HTTP_TIMEOUT", "25")))
 KEEP_RELEASES = max(2, min(10, int(os.getenv("KEEP_RELEASES", "3"))))
@@ -898,6 +898,37 @@ def build_sandbox_image(release: Path, fingerprint: str) -> str:
     return image
 
 
+def sandbox_container_diagnostics(container: str) -> str:
+    """Capture a failed runner's state and startup logs before its container is removed."""
+    sections = ["Диагностика временного sandbox runner:"]
+    try:
+        inspected = run_cmd(
+            ["docker", "inspect",
+             "--format={{.State.Status}}|exit={{.State.ExitCode}}|oom={{.State.OOMKilled}}|error={{.State.Error}}|restarts={{.RestartCount}}",
+             container],
+            timeout=15,
+            check=False,
+        )
+        state = (inspected.stdout or inspected.stderr or "").strip()
+        sections.append("Docker state: " + (state[-1000:] if state else "не получено"))
+    except Exception as exc:
+        sections.append("Docker inspect не удался: " + type(exc).__name__)
+
+    try:
+        result = run_cmd(
+            ["docker", "logs", "--tail", "80", container],
+            timeout=15,
+            check=False,
+        )
+        logs = "\\n".join(part for part in (result.stdout, result.stderr) if part).strip()
+        if not logs and result.returncode:
+            logs = (result.stderr or result.stdout or "docker logs не вернул подробностей").strip()
+        sections.append("Последние 80 строк docker logs:\\n" + (logs[-6000:] if logs else "лог пуст"))
+    except Exception as exc:
+        sections.append("Docker logs не удалось получить: " + type(exc).__name__)
+    return "\\n".join(sections)
+
+
 def ensure_sandbox_runner(release: Path, sha: str, fingerprint: str) -> tuple[str | None, bool]:
     data_dir = sandbox_app_data_source()
     work_dir = data_dir / "sandbox"
@@ -947,9 +978,10 @@ def ensure_sandbox_runner(release: Path, sha: str, fingerprint: str) -> tuple[st
     run_cmd(["docker", "start", candidate], timeout=45)
     try:
         wait_for_sandbox_probe(candidate, "http://127.0.0.1:8000/ready", "/run/secrets/sandbox_api_key")
-    except Exception:
+    except Exception as exc:
+        diagnostics = sandbox_container_diagnostics(candidate)
         run_cmd(["docker", "rm", "-f", candidate], timeout=30, check=False)
-        raise
+        raise RuntimeError(f"{exc}\\n{diagnostics}") from exc
 
     previous: str | None = None
     existing = run_cmd(["docker", "inspect", SANDBOX_CONTAINER], timeout=15, check=False)

@@ -65,8 +65,29 @@ class SandboxProvisioningTests(unittest.TestCase):
         self.assertIn('"--read-only"', source)
         self.assertIn('"--pids-limit", "256"', source)
         self.assertIn('dst=/run/secrets/sandbox_api_key,readonly', source)
+        self.assertIn('"--env", "SANDBOX_API_KEY_FILE=/run/secrets/sandbox_api_key"', source)
         self.assertNotIn('"--publish"', source)
         self.assertNotIn('"--publish-all"', source)
+
+    def test_candidate_diagnostics_capture_state_and_startup_logs(self):
+        def fake_run(args, **kwargs):
+            if args[1] == "inspect":
+                return subprocess.CompletedProcess(
+                    args, 0, "restarting|exit=1|oom=false|error=|restarts=4", ""
+                )
+            if args[1] == "logs":
+                return subprocess.CompletedProcess(
+                    args, 0, "Traceback (most recent call last):\\nRuntimeError: startup failed", ""
+                )
+            raise AssertionError(f"Unexpected command: {args}")
+
+        with patch.object(updater, "run_cmd", side_effect=fake_run) as run_cmd:
+            diagnostics = updater.sandbox_container_diagnostics("ai-ch-sandbox-candidate-test")
+
+        self.assertIn("restarting|exit=1|oom=false", diagnostics)
+        self.assertIn("RuntimeError: startup failed", diagnostics)
+        self.assertEqual(run_cmd.call_count, 2)
+
 
 
 if __name__ == "__main__":
