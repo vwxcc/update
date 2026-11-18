@@ -73,6 +73,11 @@ class SandboxProvisioningTests(unittest.TestCase):
         self.assertIn('"--env", "SANDBOX_API_KEY_FILE=/run/secrets/sandbox_api_key"', source)
         self.assertNotIn('"--publish"', source)
         self.assertNotIn('"--publish-all"', source)
+        # The builder uses a shell entrypoint; the committed runner and candidate
+        # must explicitly launch Python, never pass "python" as a shell script path.
+        self.assertIn("'ENTRYPOINT [\"python\"]'", source)
+        self.assertIn("'CMD [\"/srv/server.py\"]'", source)
+        self.assertIn('"--entrypoint", "python", image, "/srv/server.py"', source)
 
     def test_candidate_diagnostics_capture_state_and_startup_logs(self):
         def fake_run(args, **kwargs):
