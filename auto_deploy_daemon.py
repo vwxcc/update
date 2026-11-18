@@ -869,6 +869,9 @@ def ensure_sandbox_runner(release: Path, sha: str, fingerprint: str) -> tuple[st
          "--network", SANDBOX_NETWORK, "--read-only",
          "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=128m",
          "--cap-drop", "ALL", "--cap-add", "CHOWN", "--cap-add", "SETUID", "--cap-add", "SETGID",
+         # Supervisor-only permissions: collect child-owned 0700/0600 files and
+         # reset project permissions before the next run. Popen drops them on setuid.
+         "--cap-add", "DAC_OVERRIDE", "--cap-add", "FOWNER",
          "--memory", "1g", "--cpus", "1.5", "--pids-limit", "256",
          "--security-opt", "no-new-privileges",
          "--mount", f"type=bind,src={work_dir},dst=/work",
