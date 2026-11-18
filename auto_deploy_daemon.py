@@ -37,7 +37,7 @@ DOCKER_CONTAINER = os.getenv("DOCKER_CONTAINER", "ai-ch-mega").strip()
 APP_DIR = os.getenv("APP_DIR", "/app").rstrip("/")
 HEALTH_URL = os.getenv("HEALTH_URL", "http://127.0.0.1:3050/api/health").strip()
 CONTAINER_PORT = max(1, min(65535, int(os.getenv("CONTAINER_PORT", "8000"))))
-UPDATER_VERSION = 7
+UPDATER_VERSION = 8
 HEALTH_TIMEOUT = max(15, int(os.getenv("HEALTH_TIMEOUT", "90")))
 HTTP_TIMEOUT = max(5, int(os.getenv("HTTP_TIMEOUT", "25")))
 KEEP_RELEASES = max(2, min(10, int(os.getenv("KEEP_RELEASES", "3"))))
@@ -251,6 +251,69 @@ def extract_release(archive: Path, destination: Path) -> None:
     if allowed_files == 0:
         raise RuntimeError("В архиве не найдены файлы приложения.")
     validate_release(destination)
+
+
+
+def prepare_release(sha: str, releases: Path) -> Path:
+    """Return a validated immutable release; repair incomplete cached extracts atomically."""
+    if not SHA_RE.fullmatch(str(sha)):
+        raise RuntimeError("Некорректный SHA релиза.")
+
+    releases.mkdir(parents=True, exist_ok=True)
+    releases_root = releases.resolve()
+    release = releases / sha
+
+    def remove_owned_staging(path: Path) -> None:
+        # Never follow or recursively remove a symlink or a path outside releases/.
+        if path.is_symlink():
+            raise RuntimeError("Каталог релиза неожиданно является символической ссылкой.")
+        if not path.exists():
+            return
+        resolved = path.resolve()
+        if resolved.parent != releases_root or path == releases:
+            raise RuntimeError("Небезопасный путь кэша релиза; очистка отменена.")
+        if not path.is_dir():
+            raise RuntimeError("Путь кэша релиза существует, но не является каталогом.")
+        shutil.rmtree(path)
+
+    if release.is_symlink():
+        raise RuntimeError("Каталог кэша релиза является символической ссылкой; обновление остановлено.")
+    if release.exists():
+        try:
+            validate_release(release)
+            LOG.info("Использую проверенный кэш исходников релиза %s.", sha[:12])
+            return release
+        except Exception as exc:
+            LOG.warning(
+                "Кэш релиза %s неполный или повреждён (%s); удаляю только этот каталог и загружу архив заново.",
+                sha[:12], type(exc).__name__,
+            )
+            remove_owned_staging(release)
+
+    staging = releases / f".{sha}.staging-{os.getpid()}"
+    archive = UPDATE_ROOT / f".source-{sha}.tar.gz"
+    remove_owned_staging(staging)
+    try:
+        LOG.info("Скачиваю исходный код GitHub %s, commit %s.", GITHUB_REPO, sha[:12])
+        download_archive(sha, archive)
+        extract_release(archive, staging)
+        # extract_release validates the full source tree before it becomes visible
+        # under its final SHA name; interrupted downloads never poison the cache.
+        if release.exists() or release.is_symlink():
+            raise RuntimeError("Каталог релиза неожиданно появился во время распаковки.")
+        os.replace(staging, release)
+        validate_release(release)
+        LOG.info("Архив релиза %s проверен и сохранён в кэш атомарно.", sha[:12])
+        return release
+    except Exception:
+        if staging.exists() or staging.is_symlink():
+            try:
+                remove_owned_staging(staging)
+            except Exception:
+                LOG.exception("Не удалось удалить временный каталог распаковки релиза.")
+        raise
+    finally:
+        archive.unlink(missing_ok=True)
 
 
 def validate_release(path: Path) -> None:
@@ -952,17 +1015,7 @@ def perform_update(sha: str, state: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(f"Контейнер «{DOCKER_CONTAINER}» не запущен; обновление отложено.")
     releases = UPDATE_ROOT / "releases"
     releases.mkdir(parents=True, exist_ok=True)
-    release = releases / sha
-    if not release.exists():
-        archive_file = UPDATE_ROOT / f".source-{sha}.tar.gz"
-        try:
-            LOG.info("Скачиваю исходный код GitHub %s, commit %s.", GITHUB_REPO, sha[:12])
-            download_archive(sha, archive_file)
-            extract_release(archive_file, release)
-        finally:
-            archive_file.unlink(missing_ok=True)
-    else:
-        validate_release(release)
+    release = prepare_release(sha, releases)
 
     work_dir = Path(tempfile.mkdtemp(prefix="ai-ch-update-", dir=str(UPDATE_ROOT)))
     backup = UPDATE_ROOT / "backups" / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{sha[:12]}"
