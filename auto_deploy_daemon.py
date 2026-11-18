@@ -37,7 +37,7 @@ DOCKER_CONTAINER = os.getenv("DOCKER_CONTAINER", "ai-ch-mega").strip()
 APP_DIR = os.getenv("APP_DIR", "/app").rstrip("/")
 HEALTH_URL = os.getenv("HEALTH_URL", "http://127.0.0.1:3050/api/health").strip()
 CONTAINER_PORT = max(1, min(65535, int(os.getenv("CONTAINER_PORT", "8000"))))
-UPDATER_VERSION = 10
+UPDATER_VERSION = 11
 HEALTH_TIMEOUT = max(15, int(os.getenv("HEALTH_TIMEOUT", "90")))
 HTTP_TIMEOUT = max(5, int(os.getenv("HTTP_TIMEOUT", "25")))
 KEEP_RELEASES = max(2, min(10, int(os.getenv("KEEP_RELEASES", "3"))))
@@ -890,8 +890,8 @@ def build_sandbox_image(release: Path, fingerprint: str) -> str:
         )
         run_cmd(
             ["docker", "commit", "--change", "WORKDIR /srv",
-             "--change", "ENTRYPOINT []",
-             "--change", 'CMD ["python", "/srv/server.py"]',
+             "--change", 'ENTRYPOINT ["python"]',
+             "--change", 'CMD ["/srv/server.py"]',
              "--change", "EXPOSE 8000",
              "--change", "ENV PYTHONUNBUFFERED=1",
              "--change", "ENV PYTHONDONTWRITEBYTECODE=1",
@@ -977,7 +977,8 @@ def ensure_sandbox_runner(release: Path, sha: str, fingerprint: str) -> tuple[st
          "--mount", f"type=bind,src={secret},dst=/run/secrets/sandbox_api_key,readonly",
          "--env", "SANDBOX_WORK=/work", "--env", "SANDBOX_REQUIRE_AUTH=1",
          "--env", "SANDBOX_CONCURRENCY=1",
-         "--env", "SANDBOX_API_KEY_FILE=/run/secrets/sandbox_api_key", image],
+         "--env", "SANDBOX_API_KEY_FILE=/run/secrets/sandbox_api_key",
+          "--entrypoint", "python", image, "/srv/server.py"],
         timeout=60,
     )
     run_cmd(["docker", "start", candidate], timeout=45)
